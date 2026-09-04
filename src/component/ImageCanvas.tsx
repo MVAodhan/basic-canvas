@@ -1,6 +1,13 @@
 // src/components/ImageCanvas.tsx
 import { useEffect, useRef, useState } from 'react';
+import { useHotkey, useKeyHold } from '@tanstack/react-hotkeys';
 import { ModeToggle } from './mode-toggle';
+import { Button } from '#/components/ui/button';
+import { Eraser } from './eraser';
+import { Arrow } from './arrow';
+import { Pen } from './pen';
+import { Redo } from './redo';
+import { Undo } from './undo';
 
 type Tool = 'brush' | 'eraser' | 'select';
 
@@ -16,13 +23,18 @@ type Placement = Rect & { img: HTMLImageElement };
 const HANDLE_SIZE = 10; // hit area / visual size of the handles, in px
 const MIN_SIZE = 10; // don't let the image be dragged inside-out
 
-// A snapshot remembers its dimensions, because the canvas can be resized
-// between the snapshot being taken and being restored.
-type Snapshot = {
-  width: number;
-  height: number;
-  data: ImageData;
-};
+// --- CUSTOM CURSORS ---
+// Built from the same SVG paths as the toolbar icons, so the cursor
+// matches the tool. CSS cursors need explicit px dimensions (not 1em),
+// and a "hotspot" — the exact point of the glyph that does the work:
+// the eraser's edge is its bottom-left corner, the arrow's is its tip.
+const svgCursor = (d: string, hotspotX: number, hotspotY: number) =>
+  `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='white' stroke='black' stroke-width='1.5' stroke-linejoin='round' d='${d}'/%3E%3C/svg%3E") ${hotspotX} ${hotspotY}, auto`;
+
+const ARROW_PATH =
+  'm13.467 20.154l-3.336-7.185l-3.4 4.743V3.5l11.154 8.77h-5.889l3.293 7.032z';
+
+const ARROW_CURSOR = svgCursor(ARROW_PATH, 3, 3);
 
 // Cap the history: each 800x600 snapshot is ~1.9MB of RGBA bytes,
 // so an uncapped history would eat hundreds of MB fast.
@@ -35,8 +47,75 @@ export function ImageCanvas() {
   // Tool + brush settings live in state because they're UI (we render them)
   const [tool, setTool] = useState<Tool>('brush');
   const [brushSize, setBrushSize] = useState(20);
-  const [resizeWidth, setResizeWidth] = useState('800');
-  const [resizeHeight, setResizeHeight] = useState('600');
+
+  // --- ZOOM / VIEWPORT ---
+  // The canvas BITMAP stays 800x600 (document pixels). Zoom is pure CSS
+  // scaling of the element; all mouse coords are divided back down to
+  // document pixels in getCanvasCoords.
+  const [zoom, setZoom] = useState(1);
+  const zoomRef = useRef(zoom); // wheel handler reads this without re-binding
+  zoomRef.current = zoom;
+  const viewportRef = useRef<HTMLDivElement>(null); // scrollable pan area
+  const contentRef = useRef<HTMLDivElement>(null); // layout-size wrapper
+  const scaledRef = useRef<HTMLDivElement>(null); // transformed inner div
+
+  const clampZoom = (z: number) => Math.min(8, Math.max(1, z));
+
+  // Zoom keeping the document point under (clientX, clientY) fixed.
+  // The math: content coords = (scroll + cursor offset) / oldZoom.
+  // After scaling, scroll is set so that content coord * newZoom lands
+  // back under the cursor.
+  const setZoomAt = (clientX: number, clientY: number, factor: number) => {
+    const viewport = viewportRef.current;
+    const content = contentRef.current;
+    const scaled = scaledRef.current;
+    if (!viewport || !content || !scaled) return;
+
+    const oldZoom = zoomRef.current;
+    const newZoom = clampZoom(oldZoom * factor);
+    if (newZoom === oldZoom) return;
+
+    const vpRect = viewport.getBoundingClientRect();
+    const contentX = (clientX - vpRect.left + viewport.scrollLeft) / oldZoom;
+    const contentY = (clientY - vpRect.top + viewport.scrollTop) / oldZoom;
+
+    // Imperative DOM updates so scroll math and transform agree within
+    // this same tick (a setState would apply them a render later).
+    // IMPORTANT: the transform goes on the INNER div, the layout size on
+    // the WRAPPER. Putting a transform on the wrapper too would scale the
+    // content twice (zoom²) while the scroll area only grows by zoom —
+    // and then the document's edges can never be scrolled to.
+    zoomRef.current = newZoom;
+    scaled.style.transform = `scale(${newZoom})`;
+    content.style.width = `${800 * newZoom}px`;
+    content.style.height = `${600 * newZoom}px`;
+    viewport.scrollLeft = contentX * newZoom - (clientX - vpRect.left);
+    viewport.scrollTop = contentY * newZoom - (clientY - vpRect.top);
+
+    // Sync React state for the toolbar % display + re-renders
+    setZoom(newZoom);
+  };
+
+  const setZoomAtCenter = (factor: number) => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const rect = viewport.getBoundingClientRect();
+    setZoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+  };
+
+  // React's onWheel is a PASSIVE listener — preventDefault() is ignored,
+  // so the page would scroll while we zoom. A native listener with
+  // passive:false is the workaround.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      setZoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
+    };
+    viewport.addEventListener('wheel', handleWheel, { passive: false });
+    return () => viewport.removeEventListener('wheel', handleWheel);
+  }, []);
 
   // --- PLACEMENT (uncommitted loaded image) ---
   const [placement, setPlacement] = useState<Placement | null>(null);
@@ -96,13 +175,6 @@ export function ImageCanvas() {
     const ctx = overlay?.getContext('2d');
     if (!overlay || !ctx) return;
 
-    // Keep the overlay the same size as the base canvas
-    const canvas = canvasRef.current;
-    if (canvas && (overlay.width !== canvas.width || overlay.height !== canvas.height)) {
-      overlay.width = canvas.width;
-      overlay.height = canvas.height;
-    }
-
     ctx.clearRect(0, 0, overlay.width, overlay.height);
 
     if (placement) {
@@ -141,7 +213,7 @@ export function ImageCanvas() {
   // The history lives in a ref (it changes 60x/sec is irrelevant, but we
   // don't want ImageData blobs in React state). Only the *pointer position*
   // goes in state, so the buttons re-render when undo/redo becomes possible.
-  const historyRef = useRef<Snapshot[]>([]);
+  const historyRef = useRef<ImageData[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const historyIndexRef = useRef(-1);
   const [historyInfo, setHistoryInfo] = useState({ index: -1, length: 0 });
@@ -161,11 +233,7 @@ export function ImageCanvas() {
     // after our pointer are now invalid — a real editor truncates them too.
     historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
 
-    historyRef.current.push({
-      width: canvas.width,
-      height: canvas.height,
-      data: ctx.getImageData(0, 0, canvas.width, canvas.height),
-    });
+    historyRef.current.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
 
     // Evict the oldest snapshots when over the cap
     if (historyRef.current.length > MAX_HISTORY) {
@@ -195,22 +263,9 @@ export function ImageCanvas() {
     const snapshot = historyRef.current[historyIndexRef.current];
     if (!canvas || !ctx || !snapshot) return;
 
-    if (snapshot.width === canvas.width && snapshot.height === canvas.height) {
-      // Same size: putImageData OVERWRITES pixels (raw copy, ignores
-      // composite modes), which is exactly what undo needs.
-      ctx.putImageData(snapshot.data, 0, 0);
-    } else {
-      // The canvas was resized since this snapshot. putImageData can't
-      // scale, so route it through an offscreen canvas and drawImage
-      // (which CAN scale) back onto the current canvas.
-      const temp = document.createElement('canvas');
-      temp.width = snapshot.width;
-      temp.height = snapshot.height;
-      temp.getContext('2d')?.putImageData(snapshot.data, 0, 0);
-
-      ctx.reset();
-      ctx.drawImage(temp, 0, 0, canvas.width, canvas.height);
-    }
+    // putImageData OVERWRITES pixels (raw copy, ignores composite modes),
+    // which is exactly what undo needs.
+    ctx.putImageData(snapshot, 0, 0);
     syncHistoryState();
   };
 
@@ -257,14 +312,17 @@ export function ImageCanvas() {
   };
 
   // --- HELPER FUNCTION ---
-  // Translates Window Coordinates to Canvas Coordinates
+  // Translates Window Coordinates to Canvas (document) Coordinates.
+  // The canvas may be CSS-scaled by zoom, so getBoundingClientRect returns
+  // the SCALED rect. Multiplying by (bitmap size / on-screen size) divides
+  // the zoom back out — this works at ANY zoom level.
   const getCanvasCoords = (event: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
 
     const rect = canvas.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
+    const x = (event.clientX - rect.left) * (canvas.width / rect.width);
+    const y = (event.clientY - rect.top) * (canvas.height / rect.height);
     return { x, y };
   };
 
@@ -312,38 +370,6 @@ export function ImageCanvas() {
 
     // Reset the input so selecting the SAME file again still fires onChange
     event.target.value = '';
-  };
-
-  // --- IMAGE RESIZE ---
-  // Setting canvas.width/height CLEARS the canvas (even to the same value),
-  // and also resets all ctx state (composite op, styles). So the pattern is:
-  // stash pixels on an offscreen canvas -> resize -> draw them back scaled.
-  const handleResize = () => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
-    if (!canvas || !ctx) return;
-
-    const newWidth = Number(resizeWidth);
-    const newHeight = Number(resizeHeight);
-    if (!newWidth || !newHeight) return;
-
-    // 1. Stash the current pixels on an offscreen canvas.
-    //    Yes, you can drawImage a canvas onto another canvas —
-    //    a canvas is a valid image source just like an <img>.
-    const stash = document.createElement('canvas');
-    stash.width = canvas.width;
-    stash.height = canvas.height;
-    stash.getContext('2d')?.drawImage(canvas, 0, 0);
-
-    // 2. Resize (this wipes the canvas and resets ctx state)
-    canvas.width = newWidth;
-    canvas.height = newHeight;
-
-    // 3. Draw the stashed pixels back, stretched to fill the new size
-    ctx.drawImage(stash, 0, 0, newWidth, newHeight);
-
-    // Resizing is an action — undoable like everything else
-    pushSnapshot();
   };
 
   // --- SHARED DRAG MATH ---
@@ -421,9 +447,7 @@ export function ImageCanvas() {
   const handleOverlayMouseDown = (event: React.MouseEvent<HTMLCanvasElement>) => {
     const p = placement;
     if (!p) return;
-    const rect = event.currentTarget.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
+    const { x, y } = getCanvasCoords(event);
 
     const handle = hitTestHandle(p, x, y);
     const inside =
@@ -437,9 +461,7 @@ export function ImageCanvas() {
     const drag = dragRef.current;
     if (!drag || !placement) return;
     if (drag.mode === 'marquee') return; // overlay never starts marquees
-    const rect = event.currentTarget.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
+    const { x, y } = getCanvasCoords(event);
 
     setPlacement({
       img: placement.img,
@@ -589,7 +611,29 @@ export function ImageCanvas() {
 
   // --- EVENT HANDLERS ---
 
-  const handleMouseDown = (event: React.MouseEvent<HTMLCanvasElement>) => {
+  // Pointer-event handlers (React.PointerEvent extends MouseEvent, so the
+  // shared helpers like getCanvasCoords work unchanged). Pointer events
+  // carry a pointerId, which setPointerCapture needs.
+  const handleMouseDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    // Pan mode takes priority over every tool
+    if (isPanningRef.current) {
+      const viewport = viewportRef.current;
+      if (viewport) {
+        panRef.current = {
+          startX: event.clientX,
+          startY: event.clientY,
+          scrollLeft: viewport.scrollLeft,
+          scrollTop: viewport.scrollTop,
+        };
+        // POINTER CAPTURE: keep receiving events even when the cursor
+        // leaves the canvas. Without this, the drag dies the moment the
+        // cursor hits the viewport edge — you could never pan the full
+        // way in one gesture when zoomed in (the canvas fills the view).
+        (event.target as Element).setPointerCapture?.(event.pointerId);
+      }
+      return;
+    }
+
     // Select tool takes over the base canvas events entirely
     if (toolRef.current === 'select') {
       handleSelectMouseDown(event);
@@ -610,6 +654,22 @@ export function ImageCanvas() {
   };
 
   const handleMouseMove = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    // Active pan drag: convert mouse delta into scroll delta.
+    // Screen-space deltas (no zoom division) — panning is a view operation.
+    const pan = panRef.current;
+    if (pan) {
+      const viewport = viewportRef.current;
+      if (viewport) {
+        viewport.scrollLeft = pan.scrollLeft - (event.clientX - pan.startX);
+        viewport.scrollTop = pan.scrollTop - (event.clientY - pan.startY);
+      }
+      return;
+    }
+
+    if (toolRef.current === 'eraser') {
+      updateEraserCursor(event);
+    }
+
     if (toolRef.current === 'select') {
       handleSelectMouseMove(event);
       return;
@@ -629,6 +689,8 @@ export function ImageCanvas() {
   };
 
   const handleMouseUpOrLeave = () => {
+    panRef.current = null; // end any active pan drag
+
     if (toolRef.current === 'select') {
       handleSelectMouseUp();
       return;
@@ -640,11 +702,104 @@ export function ImageCanvas() {
     pushSnapshot();
   };
 
+  // --- EXPORT ---
+  // Exports the active selection region if there is one, otherwise the
+  // whole canvas. The crop pattern: draw the source region onto a fresh
+  // offscreen canvas sized exactly to the region, then export THAT —
+  // toBlob always encodes the entire canvas it's called on.
+  const exportCanvas = (format: 'png' | 'jpeg') => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    // Commit any floating selection first so its pixels are final
+    if (selRef.current) commitSelection();
+
+    let source: HTMLCanvasElement = canvas;
+    if (selection) {
+      // Crop: offscreen canvas = the region, via the 8-arg drawImage
+      source = document.createElement('canvas');
+      source.width = selection.width;
+      source.height = selection.height;
+      source
+        .getContext('2d')
+        ?.drawImage(
+          canvas,
+          selection.x, selection.y, selection.width, selection.height,
+          0, 0, selection.width, selection.height
+        );
+    }
+
+    // JPEG has no alpha channel — transparent pixels encode as BLACK.
+    // Matte the image onto white first so transparency reads as white.
+    if (format === 'jpeg') {
+      const matted = document.createElement('canvas');
+      matted.width = source.width;
+      matted.height = source.height;
+      const mctx = matted.getContext('2d');
+      if (mctx) {
+        mctx.fillStyle = '#ffffff';
+        mctx.fillRect(0, 0, matted.width, matted.height);
+        mctx.drawImage(source, 0, 0);
+      }
+      source = matted;
+    }
+
+    const mime = format === 'png' ? 'image/png' : 'image/jpeg';
+    source.toBlob((blob) => {
+      if (!blob) return;
+
+      // The download dance: object URL + a synthetic <a download> click.
+      // Same URL.createObjectURL from image loading, now in reverse.
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `export.${format}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }, mime, 0.92);
+  };
+
   // Switching tools commits any in-progress selection, so a brush stroke
   // can never paint underneath a floating region.
   const changeTool = (t: Tool) => {
     if (selRef.current) commitSelection();
     setTool(t);
+  };
+
+  // --- PAN MODE (hold Space while zoomed in) ---
+  // useKeyHold tracks press-and-hold state for us — no manual keydown/keyup
+  // bookkeeping, and it handles repeats/blur edge cases.
+  const spaceHeld = useKeyHold('Space');
+  const isPanning = spaceHeld && zoom > 1; // nothing to pan at 100%
+  const isPanningRef = useRef(isPanning);
+  isPanningRef.current = isPanning;
+
+  // While panning, stop Space from doing its browser default (scroll page).
+  // TanStack Hotkeys preventDefaults registered hotkeys by default, so an
+  // empty handler is all we need — gated on isPanning via `enabled`.
+  useHotkey('Space', () => {}, { enabled: isPanning });
+
+  // Active pan drag: start mouse pos + start scroll. Ref-driven like the
+  // eraser cursor — scroll writes go straight to the DOM at 60fps.
+  const panRef = useRef<{
+    startX: number;
+    startY: number;
+    scrollLeft: number;
+    scrollTop: number;
+  } | null>(null);
+
+  // --- ERASER SIZE CURSOR ---
+  // A custom circle that follows the mouse, sized to the eraser radius.
+  // Position is written straight to the DOM via ref (60x/sec, no re-render);
+  // only visibility uses state (enter/leave — rare).
+  const eraserCursorRef = useRef<HTMLDivElement>(null);
+  const [eraserCursorVisible, setEraserCursorVisible] = useState(false);
+
+  const updateEraserCursor = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    const el = eraserCursorRef.current;
+    if (!el) return;
+    const { x, y } = getCanvasCoords(event);
+    el.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
   };
 
   const handleClear = () => {
@@ -659,16 +814,36 @@ export function ImageCanvas() {
     <div>
       <div className='flex items-center justify-between'>
       {/* Toolbar */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'center' }}>
-        <button onClick={() => changeTool('brush')} disabled={tool === 'brush'}>
-          Brush
-        </button>
-        <button onClick={() => setTool('eraser')} disabled={tool === 'eraser'}>
-          Eraser
-        </button>
-        <button onClick={() => changeTool('select')} disabled={tool === 'select'}>
-          Select
-        </button>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 8, alignItems: 'center' }}>
+        {/* Tool buttons: the selected tool gets the 'secondary' variant as
+            its active indicator (aria-pressed also exposes state to a11y). */}
+        <Button
+          variant={tool === 'brush' ? 'secondary' : 'ghost'}
+          size="icon-sm"
+          onClick={() => changeTool('brush')}
+          aria-pressed={tool === 'brush'}
+          title="Brush"
+        >
+          <Pen />
+        </Button>
+        <Button
+          variant={tool === 'eraser' ? 'secondary' : 'ghost'}
+          size="icon-sm"
+          onClick={() => changeTool('eraser')}
+          aria-pressed={tool === 'eraser'}
+          title="Eraser"
+        >
+          <Eraser />
+        </Button>
+        <Button
+          variant={tool === 'select' ? 'secondary' : 'ghost'}
+          size="icon-sm"
+          onClick={() => changeTool('select')}
+          aria-pressed={tool === 'select'}
+          title="Select"
+        >
+          <Arrow />
+        </Button>
         <label>
           Size: {brushSize}
           <input
@@ -679,7 +854,7 @@ export function ImageCanvas() {
             onChange={(e) => setBrushSize(Number(e.target.value))}
           />
         </label>
-        <button onClick={handleClear}>Clear</button>
+        <Button onClick={handleClear}>Clear</Button>
         {/* The input is visually hidden; the button triggers it.
             This gives us a styled button with native file-picking. */}
         <input
@@ -690,31 +865,29 @@ export function ImageCanvas() {
           ref={fileInputRef}
         />
         <button onClick={() => fileInputRef.current?.click()}>Load Image</button>
-        <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <input
-            type="number"
-            value={resizeWidth}
-            onChange={(e) => setResizeWidth(e.target.value)}
-            style={{ width: 64 }}
-          />
-          ×
-          <input
-            type="number"
-            value={resizeHeight}
-            onChange={(e) => setResizeHeight(e.target.value)}
-            style={{ width: 64 }}
-          />
-          <button onClick={handleResize}>Resize</button>
-        </span>
-        <button onClick={undo} disabled={historyInfo.index <= 0}>
-          Undo
-        </button>
-        <button
+        {/* Export: selection region if one is active, else full canvas */}
+        <Button onClick={() => exportCanvas('png')}>
+          {selection ? 'Export Selection' : 'Export PNG'}
+        </Button>
+        <Button onClick={() => exportCanvas('jpeg')}>Export JPEG</Button>
+        <Button onClick={undo} disabled={historyInfo.index <= 0}>
+         <Undo/>
+        </Button>
+        <Button
           onClick={redo}
           disabled={historyInfo.index >= historyInfo.length - 1}
         >
-          Redo
+         <Redo/>
+        </Button>
+        {/* Zoom controls: click the % to reset to 100% */}
+        <button onClick={() => setZoomAtCenter(1 / 1.25)}>−</button>
+        <button
+          onClick={() => setZoomAtCenter(1 / zoomRef.current)}
+          title="Reset zoom"
+        >
+          {Math.round(zoom * 100)}%
         </button>
+        <button onClick={() => setZoomAtCenter(1.25)}>+</button>
       </div>
         <ModeToggle/>
       </div>
@@ -739,7 +912,41 @@ export function ImageCanvas() {
         </div>
       )}
 
-      <div style={{ position: 'relative', width: 'fit-content' }}>
+      {/* Viewport: the scrollable pan area, pinned to a FIXED size so
+          zooming never resizes the page layout — the content just scrolls
+          inside the same box. Scrollbars = panning. */}
+      <div
+        ref={viewportRef}
+        style={{
+          overflow: 'auto',
+          width: 800,
+          height: 600,
+          maxWidth: '100%',
+          // Hide scrollbars — panning is Space+drag now, and the bars
+          // visually break the "canvas window" illusion
+          scrollbarWidth: 'none', // Firefox
+          msOverflowStyle: 'none', // old Edge/IE
+          // Chrome/Safari via vendor pseudo-class needs a style tag, so
+          // use the Tailwind arbitrary variant instead (className below)
+        }}
+        className='[&::-webkit-scrollbar]:hidden'
+      >
+        {/* Layout-size wrapper: its box grows with zoom so the scrollbars
+            have something to scroll. transform alone doesn't affect layout. */}
+        <div
+          ref={contentRef}
+          style={{ width: 800 * zoom, height: 600 * zoom }}
+        >
+          <div
+            ref={scaledRef}
+            style={{
+              position: 'relative',
+              width: 800,
+              height: 600,
+              transform: `scale(${zoom})`,
+              transformOrigin: '0 0',
+            }}
+          >
         <canvas
           ref={canvasRef}
           width={800}
@@ -753,14 +960,48 @@ export function ImageCanvas() {
             'linear-gradient(45deg, #2e2e2e 25%, transparent 25%), linear-gradient(-45deg, #2e2e2e 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #2e2e2e 75%), linear-gradient(-45deg, transparent 75%, #2e2e2e 75%)',
           backgroundSize: '16px 16px',
           backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0px',
-          cursor: 'crosshair',
+          // Cursor follows the active tool; eraser hides the native cursor
+          // entirely — the custom circle replaces it. Space = grab cursor.
+          cursor: isPanning
+            ? 'grab'
+            : tool === 'eraser'
+              ? 'none'
+              : tool === 'select'
+                ? ARROW_CURSOR
+                : 'crosshair',
+          // Zoomed in, show the actual bitmap pixels instead of a blur
+          imageRendering: zoom > 1 ? 'pixelated' : 'auto',
           display: 'block',
         }}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUpOrLeave}
-        onMouseLeave={handleMouseUpOrLeave}
+        onPointerDown={handleMouseDown}
+        onPointerMove={handleMouseMove}
+        onPointerUp={handleMouseUpOrLeave}
+        onPointerEnter={() => setEraserCursorVisible(true)}
+        onPointerLeave={() => {
+          setEraserCursorVisible(false);
+          handleMouseUpOrLeave();
+        }}
       />
+        {/* Custom eraser cursor: a circle matching the eraser radius.
+            Rendered inside the relative container so canvas coords ==
+            container coords. pointerEvents:none keeps it click-transparent. */}
+        {tool === 'eraser' && (
+          <div
+            ref={eraserCursorRef}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: brushSize,
+              height: brushSize,
+              borderRadius: '50%',
+              border: '1px solid rgba(255,255,255,0.9)',
+              boxShadow: '0 0 0 1px rgba(0,0,0,0.5)',
+              pointerEvents: 'none',
+              display: eraserCursorVisible ? 'block' : 'none',
+            }}
+          />
+        )}
         {/* Overlay canvas: sits exactly on top of the base canvas.
             During placement it captures the mouse (blocking drawing).
             During selection it's pointer-transparent so the base canvas
@@ -783,6 +1024,25 @@ export function ImageCanvas() {
             onMouseLeave={handleOverlayMouseUp}
           />
         )}
+        {tool === 'eraser' && (
+          <div
+            ref={eraserCursorRef}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: brushSize,
+              height: brushSize,
+              borderRadius: '50%',
+              border: '1px solid rgba(255,255,255,0.9)',
+              boxShadow: '0 0 0 1px rgba(0,0,0,0.5)',
+              pointerEvents: 'none',
+              display: eraserCursorVisible ? 'block' : 'none',
+            }}
+          />
+        )}
+          </div>
+        </div>
       </div>
     </div>
   );
