@@ -3,6 +3,7 @@ import { HeadContent, Outlet, Scripts, createRootRoute } from '@tanstack/react-r
 
 import appCss from '../styles.css?url'
 import { ThemeProvider } from '#/component/theme-provider'
+import { TooltipProvider } from '#/components/ui/tooltip'
 
 export const Route = createRootRoute({
   head: () => ({
@@ -35,9 +36,13 @@ function RootDocument({  }) {
         <HeadContent />
       </head>
       <body>
+        <TooltipProvider>
+
+
         <ThemeProvider defaultTheme="system" storageKey="theme">
                   <Outlet />
-                </ThemeProvider>
+        </ThemeProvider>
+        </TooltipProvider>
 
         <Scripts />
       </body>

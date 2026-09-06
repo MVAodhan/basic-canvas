@@ -3,11 +3,17 @@ import { useEffect, useRef, useState } from 'react';
 import { useHotkey, useKeyHold } from '@tanstack/react-hotkeys';
 import { ModeToggle } from './mode-toggle';
 import { Button } from '#/components/ui/button';
+import { Tooltip, TooltipContent, TooltipTrigger } from '#/components/ui/tooltip';
 import { Eraser } from './eraser';
 import { Arrow } from './arrow';
 import { Pen } from './pen';
 import { Redo } from './redo';
 import { Undo } from './undo';
+import { Minus } from './minus';
+import { Plus } from './plus';
+import { Trash } from './trash';
+import { Load } from './load';
+import { ExportMenu } from './export-menu';
 
 type Tool = 'brush' | 'eraser' | 'select';
 
@@ -666,7 +672,7 @@ export function ImageCanvas() {
       return;
     }
 
-    if (toolRef.current === 'eraser') {
+    if (toolRef.current === 'brush' || toolRef.current === 'eraser') {
       updateEraserCursor(event);
     }
 
@@ -704,9 +710,7 @@ export function ImageCanvas() {
 
   // --- EXPORT ---
   // Exports the active selection region if there is one, otherwise the
-  // whole canvas. The crop pattern: draw the source region onto a fresh
-  // offscreen canvas sized exactly to the region, then export THAT —
-  // toBlob always encodes the entire canvas it's called on.
+  // whole canvas (the dropdown decides which items to offer).
   const exportCanvas = (format: 'png' | 'jpeg') => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -810,6 +814,9 @@ export function ImageCanvas() {
     pushSnapshot();
   };
 
+  // Both painting tools preview their radius with the follow cursor
+  const isSizeTool = tool === 'brush' || tool === 'eraser';
+
   return (
     <div>
       <div className='flex items-center justify-between'>
@@ -854,7 +861,7 @@ export function ImageCanvas() {
             onChange={(e) => setBrushSize(Number(e.target.value))}
           />
         </label>
-        <Button onClick={handleClear}>Clear</Button>
+        <Button size='icon-sm' onClick={handleClear}><Trash/></Button>
         {/* The input is visually hidden; the button triggers it.
             This gives us a styled button with native file-picking. */}
         <input
@@ -864,30 +871,40 @@ export function ImageCanvas() {
           style={{ display: 'none' }}
           ref={fileInputRef}
         />
-        <button onClick={() => fileInputRef.current?.click()}>Load Image</button>
-        {/* Export: selection region if one is active, else full canvas */}
-        <Button onClick={() => exportCanvas('png')}>
-          {selection ? 'Export Selection' : 'Export PNG'}
-        </Button>
-        <Button onClick={() => exportCanvas('jpeg')}>Export JPEG</Button>
-        <Button onClick={undo} disabled={historyInfo.index <= 0}>
+          <Button size='icon-sm' onClick={() => fileInputRef.current?.click()}><Load/>
+          </Button>
+        {/* Export dropdown: selection-aware menu items */}
+        <ExportMenu
+          hasSelection={!!selection}
+          onExport={exportCanvas}
+        />
+        <Button size='icon-sm' onClick={undo} disabled={historyInfo.index <= 0}>
          <Undo/>
         </Button>
-        <Button
+          <Button
+          size='icon-sm'
           onClick={redo}
           disabled={historyInfo.index >= historyInfo.length - 1}
         >
          <Redo/>
         </Button>
         {/* Zoom controls: click the % to reset to 100% */}
-        <button onClick={() => setZoomAtCenter(1 / 1.25)}>−</button>
-        <button
-          onClick={() => setZoomAtCenter(1 / zoomRef.current)}
-          title="Reset zoom"
-        >
-          {Math.round(zoom * 100)}%
-        </button>
-        <button onClick={() => setZoomAtCenter(1.25)}>+</button>
+        <Button variant="secondary" size='icon-sm' onClick={() => setZoomAtCenter(1 / 1.25)}>
+          <Minus/>
+        </Button>
+        <Tooltip>
+          <TooltipTrigger render={
+            <Button variant="secondary" size='sm' onClick={() => setZoomAtCenter(1 / zoomRef.current)}>
+              {Math.round(zoom * 100)}%
+            </Button>
+          } />
+          <TooltipContent>
+            <p>Reset Zoom</p>
+          </TooltipContent>
+        </Tooltip>
+        <Button variant="secondary" size='icon-sm' onClick={() => setZoomAtCenter(1.25)}>
+          <Plus/>
+        </Button>
       </div>
         <ModeToggle/>
       </div>
@@ -960,15 +977,9 @@ export function ImageCanvas() {
             'linear-gradient(45deg, #2e2e2e 25%, transparent 25%), linear-gradient(-45deg, #2e2e2e 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #2e2e2e 75%), linear-gradient(-45deg, transparent 75%, #2e2e2e 75%)',
           backgroundSize: '16px 16px',
           backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0px',
-          // Cursor follows the active tool; eraser hides the native cursor
-          // entirely — the custom circle replaces it. Space = grab cursor.
-          cursor: isPanning
-            ? 'grab'
-            : tool === 'eraser'
-              ? 'none'
-              : tool === 'select'
-                ? ARROW_CURSOR
-                : 'crosshair',
+          // Cursor follows the active tool: painting tools hide the native
+          // cursor entirely — the size circle replaces it. Space = grab.
+          cursor: isPanning ? 'grab' : tool === 'select' ? ARROW_CURSOR : 'none',
           // Zoomed in, show the actual bitmap pixels instead of a blur
           imageRendering: zoom > 1 ? 'pixelated' : 'auto',
           display: 'block',
@@ -976,16 +987,24 @@ export function ImageCanvas() {
         onPointerDown={handleMouseDown}
         onPointerMove={handleMouseMove}
         onPointerUp={handleMouseUpOrLeave}
-        onPointerEnter={() => setEraserCursorVisible(true)}
+        onPointerEnter={(e) => {
+          // Position the circle BEFORE showing it — visibility flips on
+          // enter, but the transform is only written on move, so without
+          // this the circle flashes at its unset position: the top-left
+          // corner (0,0).
+          updateEraserCursor(e);
+          setEraserCursorVisible(true);
+        }}
         onPointerLeave={() => {
           setEraserCursorVisible(false);
           handleMouseUpOrLeave();
         }}
       />
-        {/* Custom eraser cursor: a circle matching the eraser radius.
-            Rendered inside the relative container so canvas coords ==
-            container coords. pointerEvents:none keeps it click-transparent. */}
-        {tool === 'eraser' && (
+        {/* Cursor size indicator: circle matching the stroke radius for
+            brush AND eraser. Rendered inside the relative container so
+            canvas coords == container coords. pointerEvents:none keeps it
+            click-transparent. */}
+        {isSizeTool && (
           <div
             ref={eraserCursorRef}
             style={{
@@ -1002,6 +1021,7 @@ export function ImageCanvas() {
             }}
           />
         )}
+        {/* Corner size indicator removed — cursor circle only */}
         {/* Overlay canvas: sits exactly on top of the base canvas.
             During placement it captures the mouse (blocking drawing).
             During selection it's pointer-transparent so the base canvas
@@ -1022,23 +1042,6 @@ export function ImageCanvas() {
             onMouseMove={handleOverlayMouseMove}
             onMouseUp={handleOverlayMouseUp}
             onMouseLeave={handleOverlayMouseUp}
-          />
-        )}
-        {tool === 'eraser' && (
-          <div
-            ref={eraserCursorRef}
-            style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              width: brushSize,
-              height: brushSize,
-              borderRadius: '50%',
-              border: '1px solid rgba(255,255,255,0.9)',
-              boxShadow: '0 0 0 1px rgba(0,0,0,0.5)',
-              pointerEvents: 'none',
-              display: eraserCursorVisible ? 'block' : 'none',
-            }}
           />
         )}
           </div>
