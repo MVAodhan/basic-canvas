@@ -14,6 +14,8 @@ import { Plus } from './plus';
 import { Trash } from './trash';
 import { Load } from './load';
 import { ExportMenu } from './export-menu';
+import { LayersPanel, type Layer, type LayerKind } from './LayersPanel';
+import { Layers as LayersIcon } from 'lucide-react';
 
 type Tool = 'brush' | 'eraser' | 'select';
 
@@ -42,9 +44,10 @@ const ARROW_PATH =
 
 const ARROW_CURSOR = svgCursor(ARROW_PATH, 3, 3);
 
-// Cap the history: each 800x600 snapshot is ~1.9MB of RGBA bytes,
-// so an uncapped history would eat hundreds of MB fast.
-const MAX_HISTORY = 30;
+// Cap the history: every snapshot clones EVERY layer's pixels
+// (~1.9MB per 800x600 layer), so deep history × many layers eats memory
+// fast. 10 entries × a few layers is a reasonable learning-app budget.
+const MAX_HISTORY = 10;
 
 export function ImageCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -53,6 +56,62 @@ export function ImageCanvas() {
   // Tool + brush settings live in state because they're UI (we render them)
   const [tool, setTool] = useState<Tool>('brush');
   const [brushSize, setBrushSize] = useState(20);
+
+  // --- LAYERS ---
+  // Each layer owns an OFFSCREEN canvas with its own pixels. The main
+  // canvas is a COMPOSITE: cleared and redrawn from all visible layers
+  // whenever anything changes. Painting targets the ACTIVE layer's
+  // offscreen canvas, never the main canvas directly.
+  const [layers, setLayers] = useState<Layer[]>([]);
+  const layersRef = useRef<Layer[]>([]); // handlers read fresh data
+  layersRef.current = layers;
+  const [activeLayerId, setActiveLayerId] = useState<string | null>(null);
+  const activeLayerIdRef = useRef<string | null>(null);
+  activeLayerIdRef.current = activeLayerId;
+  // Bumped after any pixel change so layer thumbnails re-render
+  const [layersVersion, setLayersVersion] = useState(0);
+  const [panelOpen, setPanelOpen] = useState(true);
+
+  const makeLayer = (name: string, kind: LayerKind): Layer => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 800;
+    canvas.height = 600;
+    return {
+      id: Math.random().toString(36).slice(2),
+      name,
+      kind,
+      visible: true,
+      locked: false,
+      canvas,
+    };
+  };
+
+  // The layer painting operations target. Falls back to the top layer.
+  const activeLayer = (): Layer | null => {
+    const list = layersRef.current;
+    return (
+      list.find((l) => l.id === activeLayerIdRef.current) ??
+      list[list.length - 1] ??
+      null
+    );
+  };
+
+  // Redraw the main canvas from the layer stack, bottom to top.
+  // This is the ONLY thing that ever paints to the main canvas.
+  const composite = () => {
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (!canvas || !ctx) return;
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (const layer of layersRef.current) {
+      if (layer.visible) ctx.drawImage(layer.canvas, 0, 0);
+    }
+
+    // Bump so layer thumbnails re-render with the new pixels
+    setLayersVersion((v) => v + 1);
+  };
 
   // --- ZOOM / VIEWPORT ---
   // The canvas BITMAP stays 800x600 (document pixels). Zoom is pure CSS
@@ -136,6 +195,7 @@ export function ImageCanvas() {
     base: HTMLCanvasElement;
     region: HTMLCanvasElement;
     orig: Rect;
+    layerId: string; // the layer the pixels were lifted from
   } | null>(null);
 
   // Everything the drag handlers need, in a ref so mousemove always reads
@@ -216,10 +276,21 @@ export function ImageCanvas() {
   brushSizeRef.current = brushSize;
 
   // --- UNDO / REDO HISTORY ---
-  // The history lives in a ref (it changes 60x/sec is irrelevant, but we
-  // don't want ImageData blobs in React state). Only the *pointer position*
-  // goes in state, so the buttons re-render when undo/redo becomes possible.
-  const historyRef = useRef<ImageData[]>([]);
+  // A snapshot captures the WHOLE layer stack: each layer's pixels
+  // (ImageData) plus the structure (ids, names, visibility) and which
+  // layer was active. That way undo works for paint, layer creation,
+  // deletion, and visibility toggles alike.
+  type LayerSnapshot = {
+    id: string;
+    name: string;
+    kind: LayerKind;
+    visible: boolean;
+    locked: boolean;
+    data: ImageData;
+  };
+  type Snapshot = { layers: LayerSnapshot[]; activeId: string | null };
+
+  const historyRef = useRef<Snapshot[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const historyIndexRef = useRef(-1);
   const [historyInfo, setHistoryInfo] = useState({ index: -1, length: 0 });
@@ -228,18 +299,28 @@ export function ImageCanvas() {
     setHistoryInfo({ index: historyIndexRef.current, length: historyRef.current.length });
   };
 
-  // Reads the current canvas pixels and stores them as a history entry.
-  // Called AFTER each completed action (stroke, clear), never mid-stroke.
+  // Reads every layer's pixels and stores them as a history entry.
+  // Called AFTER each completed action (stroke, clear, layer op),
+  // never mid-stroke.
   const pushSnapshot = () => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
-    if (!canvas || !ctx) return;
-
     // If we undo 3 times and then draw something new, the "redo" entries
     // after our pointer are now invalid — a real editor truncates them too.
     historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
 
-    historyRef.current.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    historyRef.current.push({
+      activeId: activeLayerIdRef.current,
+      layers: layersRef.current.map((layer) => {
+        const lctx = layer.canvas.getContext('2d');
+        return {
+          id: layer.id,
+          name: layer.name,
+          kind: layer.kind,
+          visible: layer.visible,
+          locked: layer.locked,
+          data: lctx!.getImageData(0, 0, layer.canvas.width, layer.canvas.height),
+        };
+      }),
+    });
 
     // Evict the oldest snapshots when over the cap
     if (historyRef.current.length > MAX_HISTORY) {
@@ -264,20 +345,36 @@ export function ImageCanvas() {
   };
 
   const restoreSnapshot = () => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
     const snapshot = historyRef.current[historyIndexRef.current];
-    if (!canvas || !ctx || !snapshot) return;
+    if (!snapshot) return;
 
-    // putImageData OVERWRITES pixels (raw copy, ignores composite modes),
-    // which is exactly what undo needs.
-    ctx.putImageData(snapshot, 0, 0);
+    // Rebuild each layer's offscreen canvas from the stored pixels.
+    // Fresh canvases (not reused ones) keep this dead simple — structure
+    // AND pixels both come from the snapshot.
+    const restored: Layer[] = snapshot.layers.map((s) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = s.data.width;
+      canvas.height = s.data.height;
+      canvas.getContext('2d')?.putImageData(s.data, 0, 0);
+      return { id: s.id, name: s.name, kind: s.kind, visible: s.visible, locked: s.locked, canvas };
+    });
+
+    layersRef.current = restored;
+    setLayers(restored);
+    setActiveLayerId(snapshot.activeId);
+    composite();
     syncHistoryState();
   };
 
-  // Capture the initial blank canvas as history entry 0, so the very
-  // first stroke can be undone all the way back to empty.
+  // Create the initial Background layer + capture it as history entry 0,
+  // so the very first action can be undone all the way back to empty.
   useEffect(() => {
+    if (layersRef.current.length === 0) {
+      const bg = makeLayer('Background', 'Paint');
+      layersRef.current = [bg];
+      setLayers([bg]);
+      setActiveLayerId(bg.id);
+    }
     pushSnapshot();
   }, []);
 
@@ -479,13 +576,21 @@ export function ImageCanvas() {
     dragRef.current = null;
   };
 
-  // Apply: bake the placement into the base canvas pixels
+  // Apply: the placement becomes a NEW layer (like Pixlr — opening an
+  // image never destroys existing pixels), and it becomes the active one.
   const handleApplyPlacement = () => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
-    if (!canvas || !ctx || !placement) return;
+    if (!placement) return;
 
-    ctx.drawImage(placement.img, placement.x, placement.y, placement.width, placement.height);
+    const layer = makeLayer('Image', 'Image');
+    const lctx = layer.canvas.getContext('2d');
+    lctx?.drawImage(placement.img, placement.x, placement.y, placement.width, placement.height);
+
+    const next = [...layersRef.current, layer];
+    layersRef.current = next;
+    setLayers(next);
+    setActiveLayerId(layer.id);
+
+    composite();
     pushSnapshot();
     setPlacement(null);
   };
@@ -495,23 +600,31 @@ export function ImageCanvas() {
   };
 
   // --- SELECTION INTERACTION ---
-  // Redraws the base canvas during a selection transform:
+  // Selections are PER-LAYER: pixels are lifted from the layer that was
+  // active when the marquee closed, and transforms rewrite that layer's
+  // canvas. The composite then shows lower layers through the hole.
+  const selTargetLayer = (): Layer | null =>
+    layersRef.current.find((l) => l.id === selRef.current?.layerId) ?? null;
+
+  // Redraws the source layer during a selection transform:
   // full stash, minus the original region, plus the region at its new rect.
   const redrawSelection = (rect: Rect) => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
+    const layer = selTargetLayer();
+    const lctx = layer?.canvas.getContext('2d');
     const sel = selRef.current;
-    if (!canvas || !ctx || !sel) return;
+    if (!layer || !lctx || !sel) return;
 
     // IMPORTANT: drawImage with source-over BLENDS, it doesn't replace —
     // transparent source pixels leave the destination untouched. Without
     // this clear, every frame's region copy would survive the "restore"
     // and smear ghosts along the drag path.
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(sel.base, 0, 0);
-    ctx.clearRect(sel.orig.x, sel.orig.y, sel.orig.width, sel.orig.height);
-    ctx.drawImage(sel.region, rect.x, rect.y, rect.width, rect.height);
+    lctx.globalCompositeOperation = 'source-over';
+    lctx.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
+    lctx.drawImage(sel.base, 0, 0);
+    lctx.clearRect(sel.orig.x, sel.orig.y, sel.orig.width, sel.orig.height);
+    lctx.drawImage(sel.region, rect.x, rect.y, rect.width, rect.height);
+
+    composite();
   };
 
   // Commit = the base canvas already shows the final pixels, so all that's
@@ -524,21 +637,25 @@ export function ImageCanvas() {
   };
 
   const cancelSelection = () => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
+    const layer = selTargetLayer();
+    const lctx = layer?.canvas.getContext('2d');
     const sel = selRef.current;
-    if (ctx && sel) {
+    if (lctx && sel) {
       // Same rule as redrawSelection: clear first, then restore,
       // or the floating region would ghost itself.
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.clearRect(0, 0, canvas!.width, canvas!.height);
-      ctx.drawImage(sel.base, 0, 0);
+      lctx.globalCompositeOperation = 'source-over';
+      lctx.clearRect(0, 0, layer!.canvas.width, layer!.canvas.height);
+      lctx.drawImage(sel.base, 0, 0);
+      composite();
     }
     selRef.current = null;
     setSelection(null);
   };
 
   const handleSelectMouseDown = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    // No marquees on locked layers — selecting would lead to transforming
+    // pixels the lock is meant to protect
+    if (activeLayer()?.locked) return;
     const { x, y } = getCanvasCoords(event);
 
     // Already have a selection? Check for handle/body grabs first.
@@ -593,15 +710,16 @@ export function ImageCanvas() {
       return;
     }
 
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
-    if (!canvas || !ctx) return;
+    const layer = activeLayer();
+    if (!layer) return;
+    const lctx = layer.canvas.getContext('2d');
+    if (!lctx) return;
 
-    // "Lift" the pixels: stash the full canvas, copy the region out.
+    // "Lift" the pixels: stash the full LAYER, copy the region out.
     const base = document.createElement('canvas');
-    base.width = canvas.width;
-    base.height = canvas.height;
-    base.getContext('2d')?.drawImage(canvas, 0, 0);
+    base.width = layer.canvas.width;
+    base.height = layer.canvas.height;
+    base.getContext('2d')?.drawImage(layer.canvas, 0, 0);
 
     const region = document.createElement('canvas');
     region.width = selection.width;
@@ -609,9 +727,9 @@ export function ImageCanvas() {
     // The 8-arg drawImage: source rect -> dest rect. Here 1:1.
     region
       .getContext('2d')
-      ?.drawImage(canvas, selection.x, selection.y, selection.width, selection.height, 0, 0, selection.width, selection.height);
+      ?.drawImage(layer.canvas, selection.x, selection.y, selection.width, selection.height, 0, 0, selection.width, selection.height);
 
-    selRef.current = { base, region, orig: { ...selection } };
+    selRef.current = { base, region, orig: { ...selection }, layerId: layer.id };
     redrawSelection(selection);
   };
 
@@ -646,9 +764,11 @@ export function ImageCanvas() {
       return;
     }
 
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
+    // Paint on the ACTIVE layer's offscreen canvas — never the main canvas.
+    // Locked layers refuse edits (that's the whole point of the lock).
+    const layer = activeLayer();
+    if (!layer || layer.locked) return;
+    const ctx = layer.canvas.getContext('2d');
     if (!ctx) return;
 
     const { x, y } = getCanvasCoords(event);
@@ -683,15 +803,18 @@ export function ImageCanvas() {
 
     if (!isDrawingRef.current) return;
 
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
+    const layer = activeLayer();
+    if (!layer) return;
+    const ctx = layer.canvas.getContext('2d');
     if (!ctx) return;
 
     const { x, y } = getCanvasCoords(event);
 
     ctx.lineTo(x, y);
     ctx.stroke();
+
+    // Recomposite: the main canvas always mirrors the layer stack
+    composite();
   };
 
   const handleMouseUpOrLeave = () => {
@@ -807,10 +930,122 @@ export function ImageCanvas() {
   };
 
   const handleClear = () => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
-    ctx?.reset();
+    // Clear the ACTIVE layer only — other layers keep their pixels.
+    // Locked layers refuse clears.
+    const layer = activeLayer();
+    if (!layer || layer.locked) return;
+    const ctx = layer.canvas.getContext('2d');
+    ctx?.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
+    composite();
     // Clearing is an action too — make it undoable
+    pushSnapshot();
+  };
+
+  // --- LAYER OPERATIONS (from the panel) ---
+  const activateLayer = (id: string) => {
+    setActiveLayerId(id);
+  };
+
+  const toggleLayerVisible = (id: string) => {
+    const next = layersRef.current.map((l) =>
+      l.id === id ? { ...l, visible: !l.visible } : l
+    );
+    layersRef.current = next;
+    setLayers(next);
+    composite();
+    // Visibility is part of the snapshot, so it's undoable too
+    pushSnapshot();
+  };
+
+  // Lock/unlock via the layer's context menu. If that layer has a
+  // floating selection, commit it first — a locked layer must not be
+  // transformed afterwards.
+  const toggleLayerLock = (id: string) => {
+    if (selRef.current?.layerId === id) commitSelection();
+
+    const next = layersRef.current.map((l) =>
+      l.id === id ? { ...l, locked: !l.locked } : l
+    );
+    layersRef.current = next;
+    setLayers(next);
+    // No composite needed — locking changes no pixels, only future edits
+    pushSnapshot();
+  };
+
+  // Clone a layer's pixels into a new layer placed directly ABOVE the
+  // original (higher z), and make it active — ready to edit.
+  const duplicateLayer = (id: string) => {
+    const index = layersRef.current.findIndex((l) => l.id === id);
+    if (index === -1) return;
+    const src = layersRef.current[index];
+
+    const canvas = document.createElement('canvas');
+    canvas.width = src.canvas.width;
+    canvas.height = src.canvas.height;
+    canvas.getContext('2d')?.drawImage(src.canvas, 0, 0);
+
+    const copy: Layer = {
+      id: Math.random().toString(36).slice(2),
+      name: `${src.name} copy`,
+      kind: src.kind,
+      visible: src.visible,
+      locked: false, // a duplicate starts unlocked — you duplicate to edit it
+      canvas,
+    };
+
+    const next = [...layersRef.current];
+    next.splice(index + 1, 0, copy);
+    layersRef.current = next;
+    setLayers(next);
+    setActiveLayerId(copy.id);
+
+    composite();
+    pushSnapshot();
+  };
+
+  const deleteLayer = (id: string) => {
+    // A selection lifted from this layer dies with it — there's nothing
+    // to commit into (and committing would write into a removed layer)
+    if (selRef.current?.layerId === id) {
+      selRef.current = null;
+      setSelection(null);
+    }
+
+    let next = layersRef.current.filter((l) => l.id !== id);
+
+    // Never leave the document with zero layers — replace with a fresh
+    // empty Background so painting always has a target
+    if (next.length === 0) {
+      next = [makeLayer('Background', 'Paint')];
+    }
+
+    layersRef.current = next;
+    setLayers(next);
+
+    // Fix the active layer if it (no longer) exists
+    if (!next.some((l) => l.id === activeLayerIdRef.current)) {
+      setActiveLayerId(next[next.length - 1].id);
+    }
+
+    composite();
+    pushSnapshot();
+  };
+
+  // Drag & drop reorder (LayersPanel): the dragged layer takes the slot
+  // of the layer it was dropped on. Order matters — the composite draws
+  // bottom to top, so reordering changes what's on top.
+  const reorderLayers = (fromId: string, toId: string) => {
+    const next = [...layersRef.current];
+    const from = next.findIndex((l) => l.id === fromId);
+    const to = next.findIndex((l) => l.id === toId);
+    if (from === -1 || to === -1 || from === to) return;
+
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+
+    layersRef.current = next;
+    setLayers(next);
+    composite();
     pushSnapshot();
   };
 
@@ -861,7 +1096,7 @@ export function ImageCanvas() {
             onChange={(e) => setBrushSize(Number(e.target.value))}
           />
         </label>
-        <Button size='icon-sm' onClick={handleClear}><Trash/></Button>
+        <Button variant="secondary" size='icon-sm' onClick={handleClear} title="Clear layer"><Trash/></Button>
         {/* The input is visually hidden; the button triggers it.
             This gives us a styled button with native file-picking. */}
         <input
@@ -871,17 +1106,19 @@ export function ImageCanvas() {
           style={{ display: 'none' }}
           ref={fileInputRef}
         />
-          <Button size='icon-sm' onClick={() => fileInputRef.current?.click()}><Load/>
-          </Button>
+        <Button variant="secondary" size='icon-sm' onClick={() => fileInputRef.current?.click()} title="Load Image">
+          <Load/>
+        </Button>
         {/* Export dropdown: selection-aware menu items */}
         <ExportMenu
           hasSelection={!!selection}
           onExport={exportCanvas}
         />
-        <Button size='icon-sm' onClick={undo} disabled={historyInfo.index <= 0}>
+        <Button variant="secondary" size='icon-sm' onClick={undo} disabled={historyInfo.index <= 0}>
          <Undo/>
         </Button>
-          <Button
+        <Button
+          variant="secondary"
           size='icon-sm'
           onClick={redo}
           disabled={historyInfo.index >= historyInfo.length - 1}
@@ -904,6 +1141,16 @@ export function ImageCanvas() {
         </Tooltip>
         <Button variant="secondary" size='icon-sm' onClick={() => setZoomAtCenter(1.25)}>
           <Plus/>
+        </Button>
+        {/* Layers panel toggle */}
+        <Button
+          variant={panelOpen ? 'secondary' : 'ghost'}
+          size='icon-sm'
+          onClick={() => setPanelOpen((open) => !open)}
+          aria-pressed={panelOpen}
+          title="Layers"
+        >
+          <LayersIcon />
         </Button>
       </div>
         <ModeToggle/>
@@ -929,6 +1176,8 @@ export function ImageCanvas() {
         </div>
       )}
 
+      {/* Canvas + layers panel side by side */}
+      <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
       {/* Viewport: the scrollable pan area, pinned to a FIXED size so
           zooming never resizes the page layout — the content just scrolls
           inside the same box. Scrollbars = panning. */}
@@ -1046,6 +1295,22 @@ export function ImageCanvas() {
         )}
           </div>
         </div>
+      </div>
+
+      {panelOpen && (
+        <LayersPanel
+          layers={layers}
+          activeId={activeLayerId}
+          version={layersVersion}
+          onActivate={activateLayer}
+          onToggleVisible={toggleLayerVisible}
+          onToggleLock={toggleLayerLock}
+          onDuplicate={duplicateLayer}
+          onDelete={deleteLayer}
+          onReorder={reorderLayers}
+          onClose={() => setPanelOpen(false)}
+        />
+      )}
       </div>
     </div>
   );
