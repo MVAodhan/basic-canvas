@@ -44,6 +44,19 @@ const ARROW_PATH =
 
 const ARROW_CURSOR = svgCursor(ARROW_PATH, 3, 3);
 
+// CSS cursor per transform handle: corners resize diagonally, edges
+// resize along one axis. Direction matches which corner/edge you grabbed.
+const HANDLE_CURSOR: Record<Handle, string> = {
+  nw: 'nwse-resize',
+  se: 'nwse-resize',
+  ne: 'nesw-resize',
+  sw: 'nesw-resize',
+  n: 'ns-resize',
+  s: 'ns-resize',
+  e: 'ew-resize',
+  w: 'ew-resize',
+};
+
 // Cap the history: every snapshot clones EVERY layer's pixels
 // (~1.9MB per 800x600 layer), so deep history × many layers eats memory
 // fast. 10 entries × a few layers is a reasonable learning-app budget.
@@ -196,7 +209,14 @@ export function ImageCanvas() {
     region: HTMLCanvasElement;
     orig: Rect;
     layerId: string; // the layer the pixels were lifted from
+    isImageSelect: boolean; // true = created by one-click image selection
   } | null>(null);
+
+  // Hover-aware cursors: the overlay (placement) and base canvas
+  // (selection) switch their cursor based on what's under the pointer —
+  // resize arrows near handles, move arrow over the body.
+  const [placementCursor, setPlacementCursor] = useState('move');
+  const [canvasCursor, setCanvasCursor] = useState<string | null>(null);
 
   // Everything the drag handlers need, in a ref so mousemove always reads
   // fresh values without re-binding listeners.
@@ -286,6 +306,7 @@ export function ImageCanvas() {
     kind: LayerKind;
     visible: boolean;
     locked: boolean;
+    bounds?: Rect;
     data: ImageData;
   };
   type Snapshot = { layers: LayerSnapshot[]; activeId: string | null };
@@ -317,6 +338,7 @@ export function ImageCanvas() {
           kind: layer.kind,
           visible: layer.visible,
           locked: layer.locked,
+          bounds: layer.bounds,
           data: lctx!.getImageData(0, 0, layer.canvas.width, layer.canvas.height),
         };
       }),
@@ -356,7 +378,15 @@ export function ImageCanvas() {
       canvas.width = s.data.width;
       canvas.height = s.data.height;
       canvas.getContext('2d')?.putImageData(s.data, 0, 0);
-      return { id: s.id, name: s.name, kind: s.kind, visible: s.visible, locked: s.locked, canvas };
+      return {
+        id: s.id,
+        name: s.name,
+        kind: s.kind,
+        visible: s.visible,
+        locked: s.locked,
+        bounds: s.bounds,
+        canvas,
+      };
     });
 
     layersRef.current = restored;
@@ -557,6 +587,9 @@ export function ImageCanvas() {
       x >= p.x && x <= p.x + p.width && y >= p.y && y <= p.y + p.height;
     if (!handle && !inside) return;
 
+    // Lock in the cursor for the whole drag, even outside the handle
+    setPlacementCursor(handle ? HANDLE_CURSOR[handle] : 'move');
+
     dragRef.current = { mode: handle ?? 'move', startX: x, startY: y, orig: { ...p } };
   };
 
@@ -566,10 +599,24 @@ export function ImageCanvas() {
     if (drag.mode === 'marquee') return; // overlay never starts marquees
     const { x, y } = getCanvasCoords(event);
 
+    // While dragging, keep the cursor of the handle being dragged
+    setPlacementCursor(drag.mode === 'move' ? 'move' : HANDLE_CURSOR[drag.mode]);
+
     setPlacement({
       img: placement.img,
       ...computeDragRect(drag.mode, drag.orig, drag.startX, drag.startY, x, y),
     });
+  };
+
+  const handleOverlayHover = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    // Not dragging: point feedback — cursor reflects what's under the pointer
+    if (!placement) return;
+    const { x, y } = getCanvasCoords(event);
+    const handle = hitTestHandle(placement, x, y);
+    const inside =
+      x >= placement.x && x <= placement.x + placement.width &&
+      y >= placement.y && y <= placement.y + placement.height;
+    setPlacementCursor(handle ? HANDLE_CURSOR[handle] : inside ? 'move' : 'default');
   };
 
   const handleOverlayMouseUp = () => {
@@ -578,10 +625,20 @@ export function ImageCanvas() {
 
   // Apply: the placement becomes a NEW layer (like Pixlr — opening an
   // image never destroys existing pixels), and it becomes the active one.
+  // The placement rect is remembered as the layer's BOUNDS — that's what
+  // makes one-click selection of the image possible later.
   const handleApplyPlacement = () => {
     if (!placement) return;
 
-    const layer = makeLayer('Image', 'Image');
+    const layer: Layer = {
+      ...makeLayer('Image', 'Image'),
+      bounds: {
+        x: placement.x,
+        y: placement.y,
+        width: placement.width,
+        height: placement.height,
+      },
+    };
     const lctx = layer.canvas.getContext('2d');
     lctx?.drawImage(placement.img, placement.x, placement.y, placement.width, placement.height);
 
@@ -605,6 +662,55 @@ export function ImageCanvas() {
   // canvas. The composite then shows lower layers through the hole.
   const selTargetLayer = (): Layer | null =>
     layersRef.current.find((l) => l.id === selRef.current?.layerId) ?? null;
+
+  // --- ONE-CLICK IMAGE SELECT ---
+  // Topmost-first hit test over visible, unlocked Image layers: the click
+  // must be inside the layer's bounds AND on an opaque pixel (transparent
+  // areas of an image let clicks fall through to layers below).
+  const findImageLayerAt = (x: number, y: number): Layer | null => {
+    const list = layersRef.current;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const layer = list[i];
+      if (!layer.visible || layer.locked || layer.kind !== 'Image' || !layer.bounds) continue;
+      const b = layer.bounds;
+      if (x < b.x || x > b.x + b.width || y < b.y || y > b.y + b.height) continue;
+
+      // Sample the actual pixel — bounds alone would catch transparent holes
+      const alpha =
+        layer.canvas.getContext('2d')?.getImageData(Math.floor(x), Math.floor(y), 1, 1).data[3] ?? 0;
+      if (alpha > 0) return layer;
+    }
+    return null;
+  };
+
+  // Select an image layer with ONE click: lift its stored bounds as a
+  // floating selection so the existing move/resize machinery takes over.
+  const selectImageLayer = (layer: Layer) => {
+    const bounds = layer.bounds!;
+
+    const base = document.createElement('canvas');
+    base.width = layer.canvas.width;
+    base.height = layer.canvas.height;
+    base.getContext('2d')?.drawImage(layer.canvas, 0, 0);
+
+    const region = document.createElement('canvas');
+    region.width = bounds.width;
+    region.height = bounds.height;
+    region
+      .getContext('2d')
+      ?.drawImage(layer.canvas, bounds.x, bounds.y, bounds.width, bounds.height, 0, 0, bounds.width, bounds.height);
+
+    selRef.current = {
+      base,
+      region,
+      orig: { ...bounds },
+      layerId: layer.id,
+      isImageSelect: true,
+    };
+    // Clicking an image also activates its layer (paint would target it)
+    setActiveLayerId(layer.id);
+    setSelection({ ...bounds });
+  };
 
   // Redraws the source layer during a selection transform:
   // full stash, minus the original region, plus the region at its new rect.
@@ -631,6 +737,20 @@ export function ImageCanvas() {
   // left is to snapshot history and drop the floating state.
   const commitSelection = () => {
     if (!selRef.current) return;
+
+    // One-click image selections OWN the layer's bounds: after a
+    // move/resize, snap the stored bounds to the final rect so the next
+    // click re-selects the image where it is NOW. Marquee selections
+    // don't touch bounds — they moved an arbitrary region, not the image.
+    const layer = selTargetLayer();
+    if (layer && selRef.current.isImageSelect && selection) {
+      const next = layersRef.current.map((l) =>
+        l.id === layer.id ? { ...l, bounds: { ...selection } } : l
+      );
+      layersRef.current = next;
+      setLayers(next);
+    }
+
     pushSnapshot();
     selRef.current = null;
     setSelection(null);
@@ -653,9 +773,6 @@ export function ImageCanvas() {
   };
 
   const handleSelectMouseDown = (event: React.MouseEvent<HTMLCanvasElement>) => {
-    // No marquees on locked layers — selecting would lead to transforming
-    // pixels the lock is meant to protect
-    if (activeLayer()?.locked) return;
     const { x, y } = getCanvasCoords(event);
 
     // Already have a selection? Check for handle/body grabs first.
@@ -668,10 +785,20 @@ export function ImageCanvas() {
         dragRef.current = { mode: handle ?? 'move', startX: x, startY: y, orig: { ...selection } };
         return;
       }
-      // Clicked outside: commit the current transform, start a new marquee
+      // Clicked outside: commit the current transform, then re-target
       commitSelection();
     }
 
+    // ONE-CLICK IMAGE SELECT: clicking an image grabs the whole image —
+    // no marquee needed. Marquee is only for custom regions.
+    const hitLayer = findImageLayerAt(x, y);
+    if (hitLayer) {
+      selectImageLayer(hitLayer);
+      return;
+    }
+
+    // Marquee on the active layer (locked layers refuse)
+    if (activeLayer()?.locked) return;
     dragRef.current = { mode: 'marquee', startX: x, startY: y, orig: { x, y, width: 0, height: 0 } };
     setSelection({ x, y, width: 0, height: 0 });
   };
@@ -729,7 +856,7 @@ export function ImageCanvas() {
       .getContext('2d')
       ?.drawImage(layer.canvas, selection.x, selection.y, selection.width, selection.height, 0, 0, selection.width, selection.height);
 
-    selRef.current = { base, region, orig: { ...selection }, layerId: layer.id };
+    selRef.current = { base, region, orig: { ...selection }, layerId: layer.id, isImageSelect: false };
     redrawSelection(selection);
   };
 
@@ -797,6 +924,22 @@ export function ImageCanvas() {
     }
 
     if (toolRef.current === 'select') {
+      // Hover feedback over selection handles/body (only when not dragging)
+      if (!dragRef.current) {
+        if (selection) {
+          const { x, y } = getCanvasCoords(event);
+          const handle = hitTestHandle(selection, x, y);
+          const inside =
+            x >= selection.x && x <= selection.x + selection.width &&
+            y >= selection.y && y <= selection.y + selection.height;
+          setCanvasCursor(handle ? HANDLE_CURSOR[handle] : inside ? 'move' : ARROW_CURSOR);
+        } else {
+          // Hovering an image with the select tool = it's one click away
+          // from being selected — advertise that with the move cursor
+          const { x, y } = getCanvasCoords(event);
+          setCanvasCursor(findImageLayerAt(x, y) ? 'move' : null);
+        }
+      }
       handleSelectMouseMove(event);
       return;
     }
@@ -1228,7 +1371,8 @@ export function ImageCanvas() {
           backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0px',
           // Cursor follows the active tool: painting tools hide the native
           // cursor entirely — the size circle replaces it. Space = grab.
-          cursor: isPanning ? 'grab' : tool === 'select' ? ARROW_CURSOR : 'none',
+          // Select tool: hover-aware (resize arrows near selection handles).
+          cursor: isPanning ? 'grab' : tool === 'select' ? canvasCursor ?? ARROW_CURSOR : 'none',
           // Zoomed in, show the actual bitmap pixels instead of a blur
           imageRendering: zoom > 1 ? 'pixelated' : 'auto',
           display: 'block',
@@ -1284,11 +1428,15 @@ export function ImageCanvas() {
               position: 'absolute',
               top: 0,
               left: 0,
-              cursor: 'move',
+              cursor: placementCursor,
               pointerEvents: placement ? 'auto' : 'none',
             }}
             onMouseDown={handleOverlayMouseDown}
-            onMouseMove={handleOverlayMouseMove}
+            onMouseMove={(e) => {
+              // Hover feedback only when not mid-drag (a drag locks its cursor)
+              if (!dragRef.current) handleOverlayHover(e);
+              handleOverlayMouseMove(e);
+            }}
             onMouseUp={handleOverlayMouseUp}
             onMouseLeave={handleOverlayMouseUp}
           />

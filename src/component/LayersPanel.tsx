@@ -18,6 +18,9 @@ export type Layer = {
   visible: boolean
   locked: boolean
   canvas: HTMLCanvasElement
+  // Only meaningful for Image layers: where the image sits on the canvas.
+  // Enables one-click selection of the image's boundaries.
+  bounds?: { x: number; y: number; width: number; height: number }
 }
 
 // Thumbnail: a tiny canvas that mirrors a layer's pixels. Redraws whenever
