@@ -1300,9 +1300,9 @@ export function ImageCanvas() {
 
       {placement && (
         <div style={{ marginBottom: 8, display: 'flex', gap: 8 }}>
-          <button onClick={handleApplyPlacement}>Apply Image</button>
-          <button onClick={handleCancelPlacement}>Cancel</button>
-          <span style={{ alignSelf: 'center', color: '#888', fontSize: 13 }}>
+          <button className="rounded-md bg-secondary px-2.5 py-1 text-sm text-secondary-foreground transition-colors hover:bg-accent" onClick={handleApplyPlacement}>Apply Image</button>
+          <button className="rounded-md bg-secondary px-2.5 py-1 text-sm text-secondary-foreground transition-colors hover:bg-accent" onClick={handleCancelPlacement}>Cancel</button>
+          <span className="self-center text-[13px] text-muted-foreground">
             Drag to move · corners scale · edges stretch
           </span>
         </div>
@@ -1310,9 +1310,9 @@ export function ImageCanvas() {
 
       {selection && !placement && (
         <div style={{ marginBottom: 8, display: 'flex', gap: 8 }}>
-          <button onClick={commitSelection}>Apply Selection</button>
-          <button onClick={cancelSelection}>Cancel</button>
-          <span style={{ alignSelf: 'center', color: '#888', fontSize: 13 }}>
+          <button className="rounded-md bg-secondary px-2.5 py-1 text-sm text-secondary-foreground transition-colors hover:bg-accent" onClick={commitSelection}>Apply Selection</button>
+          <button className="rounded-md bg-secondary px-2.5 py-1 text-sm text-secondary-foreground transition-colors hover:bg-accent" onClick={cancelSelection}>Cancel</button>
+          <span className="self-center text-[13px] text-muted-foreground">
             Drag inside to move · handles to resize · click outside to apply
           </span>
         </div>
@@ -1363,9 +1363,10 @@ export function ImageCanvas() {
 
           // Checkerboard = the universal "this area is transparent" pattern.
           // The canvas itself is transparent; this is just what shows through.
-          backgroundColor: '#262626',
+          // Colors come from CSS vars so light/dark modes both look right.
+          backgroundColor: 'var(--checker-a)',
           backgroundImage:
-            'linear-gradient(45deg, #2e2e2e 25%, transparent 25%), linear-gradient(-45deg, #2e2e2e 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #2e2e2e 75%), linear-gradient(-45deg, transparent 75%, #2e2e2e 75%)',
+            'linear-gradient(45deg, var(--checker-b) 25%, transparent 25%), linear-gradient(-45deg, var(--checker-b) 25%, transparent 25%), linear-gradient(45deg, transparent 75%, var(--checker-b) 75%), linear-gradient(-45deg, transparent 75%, var(--checker-b) 75%)',
           backgroundSize: '16px 16px',
           backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0px',
           // Cursor follows the active tool: painting tools hide the native

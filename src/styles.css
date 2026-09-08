@@ -96,6 +96,9 @@ body {
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  /* Transparency checkerboard behind the canvas (light: soft greys) */
+  --checker-a: oklch(0.922 0 0);
+  --checker-b: oklch(0.97 0 0);
 }
 
 .dark {
@@ -130,6 +133,9 @@ body {
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
+  /* Dark mode keeps the original charcoal checkerboard */
+  --checker-a: #262626;
+  --checker-b: #2e2e2e;
 }
 
 @layer base {

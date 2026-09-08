@@ -81,17 +81,17 @@ function SortableLayerRow({
             style={{ opacity: isDragging ? 0.4 : 1 }}
             className={`flex cursor-grab items-center gap-2 rounded-md p-1.5 ring-1 transition-colors select-none active:cursor-grabbing ${
               isActive
-                ? 'bg-neutral-700 ring-white/20'
-                : 'bg-neutral-800 ring-transparent hover:bg-neutral-750'
+                ? 'bg-accent ring-border'
+                : 'bg-secondary ring-transparent hover:bg-accent/60'
             } ${isDragging ? 'ring-blue-400/60' : ''}`}
           >
             <LayerThumb canvas={layer.canvas} version={version} />
             <div className="min-w-0 flex-1 leading-tight">
-              <div className="flex items-center gap-1 truncate text-sm font-medium text-white">
-                {layer.locked && <Lock className="h-3 w-3 shrink-0 text-neutral-400" />}
+              <div className="flex items-center gap-1 truncate text-sm font-medium text-foreground">
+                {layer.locked && <Lock className="h-3 w-3 shrink-0 text-muted-foreground" />}
                 {layer.name}
               </div>
-              <div className="text-xs text-neutral-400">{layer.kind}</div>
+              <div className="text-xs text-muted-foreground">{layer.kind}</div>
             </div>
             <button
               onClick={(e) => {
@@ -99,7 +99,7 @@ function SortableLayerRow({
                 onToggleVisible(layer.id)
               }}
               onPointerDown={(e) => e.stopPropagation()} // never start a drag from the eye
-              className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-neutral-300 hover:bg-white/10 hover:text-white"
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
               aria-label={layer.visible ? `Hide ${layer.name}` : `Show ${layer.name}`}
             >
               {layer.visible ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
@@ -172,21 +172,21 @@ export function LayersPanel({
   };
 
   return (
-    <div className="w-60 shrink-0 overflow-hidden rounded-lg bg-neutral-900 shadow-lg ring-1 ring-white/10">
+    <div className="w-60 shrink-0 overflow-hidden rounded-lg bg-card shadow-lg ring-1 ring-border">
       {/* Header */}
       <div className="relative flex items-center justify-center px-2 py-2">
-        <span className="text-sm font-semibold text-white">Layers</span>
+        <span className="text-sm font-semibold text-foreground">Layers</span>
         <div className="absolute right-1.5 flex items-center gap-0.5">
           <button
             onClick={() => setCollapsed((c) => !c)}
-            className="flex h-6 w-6 items-center justify-center rounded text-neutral-400 hover:bg-white/10 hover:text-white"
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
             aria-label={collapsed ? 'Expand panel' : 'Collapse panel'}
           >
             —
           </button>
           <button
             onClick={onClose}
-            className="flex h-6 w-6 items-center justify-center rounded text-neutral-400 hover:bg-white/10 hover:text-white"
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
             aria-label="Close panel"
           >
             ×
@@ -213,7 +213,7 @@ export function LayersPanel({
               />
             ))}
             {layers.length === 0 && (
-              <div className="flex items-center justify-center gap-1.5 p-4 text-xs text-neutral-500">
+              <div className="flex items-center justify-center gap-1.5 p-4 text-xs text-muted-foreground">
                 <LayersIcon className="h-3.5 w-3.5" /> No layers
               </div>
             )}
