@@ -79,15 +79,17 @@ function SortableLayerRow({
             ref={ref}
             onClick={() => onActivate(layer.id)}
             style={{ opacity: isDragging ? 0.4 : 1 }}
-            className={`flex cursor-grab items-center gap-2 rounded-md p-1.5 ring-1 transition-colors select-none active:cursor-grabbing ${
+            className={`flex cursor-grab items-center gap-2 rounded-md p-1.5 ring-2 transition-colors select-none active:cursor-grabbing ${
               isActive
-                ? 'bg-accent ring-border'
-                : 'bg-secondary ring-transparent hover:bg-accent/60'
+                ? 'bg-blue-500/10 ring-blue-500 dark:bg-blue-400/15 dark:ring-blue-400'
+                : 'ring-transparent hover:bg-accent/60'
             } ${isDragging ? 'ring-blue-400/60' : ''}`}
           >
             <LayerThumb canvas={layer.canvas} version={version} />
             <div className="min-w-0 flex-1 leading-tight">
-              <div className="flex items-center gap-1 truncate text-sm font-medium text-foreground">
+              <div className={`flex items-center gap-1 truncate text-sm ${
+                isActive ? 'font-semibold text-foreground' : 'font-medium text-foreground'
+              }`}>
                 {layer.locked && <Lock className="h-3 w-3 shrink-0 text-muted-foreground" />}
                 {layer.name}
               </div>

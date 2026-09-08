@@ -1133,6 +1133,11 @@ export function ImageCanvas() {
       visible: src.visible,
       locked: false, // a duplicate starts unlocked — you duplicate to edit it
       canvas,
+      // Image layers carry their placement: the pixels were cloned at the
+      // same coordinates, so the duplicate owns the SAME bounds. Without
+      // this, one-click selection ignores the copy (hit test skips layers
+      // with no bounds).
+      bounds: src.bounds ? { ...src.bounds } : undefined,
     };
 
     const next = [...layersRef.current];
