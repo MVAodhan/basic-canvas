@@ -1,7 +1,6 @@
 // src/components/ImageCanvas.tsx
 import { useEffect, useRef, useState } from 'react';
 import { useHotkey, useKeyHold } from '@tanstack/react-hotkeys';
-import { ModeToggle } from './mode-toggle';
 import { Button } from '#/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '#/components/ui/tooltip';
 import { Eraser } from './eraser';
@@ -1296,7 +1295,7 @@ export function ImageCanvas() {
           <LayersIcon />
         </Button>
       </div>
-        <ModeToggle/>
+
       </div>
 
       {placement && (
