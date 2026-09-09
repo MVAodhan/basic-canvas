@@ -13,6 +13,7 @@ import { Plus } from './plus';
 import { Trash } from './trash';
 import { Load } from './load';
 import { ExportMenu } from './export-menu';
+import { StickerizeMenu } from './stickerize-menu';
 import { LayersPanel, type Layer, type LayerKind } from './LayersPanel';
 import { Layers as LayersIcon } from 'lucide-react';
 
@@ -1083,6 +1084,129 @@ export function ImageCanvas() {
     pushSnapshot();
   };
 
+  // --- STICKERIZE ---
+  // Wrap the active layer's opaque pixels in a white outline. The outline
+  // follows the layer's ALPHA silhouette (erased areas get no stroke), not
+  // the canvas rect — so it hugs whatever shape remains after cleanup.
+  //
+  // How the outline is grown: in morphology terms we need a DILATION of the
+  // silhouette by a disc of radius `strokeWidth`. A disc = every offset
+  // vector of length <= r, and dilation = the union of the shape translated
+  // by each of those offsets. So: stamp the white silhouette at every point
+  // of circles r = 1..strokeWidth and the union of the stamps is the
+  // silhouette grown outward with a rounded edge.
+  const stickerizeLayer = (strokeWidth: number) => {
+    if (strokeWidth <= 0) return;
+    // Rewrites the whole layer, so a floating piece must land first
+    if (selRef.current) commitSelection();
+
+    const layer = activeLayer();
+    if (!layer || layer.locked) return;
+    const src = layer.canvas;
+    const srcCtx = src.getContext('2d');
+    if (!srcCtx) return;
+
+    // 1. Tight bounding box of non-transparent pixels. We work on the crop,
+    //    not the full 800x600 canvas — the stamping loop below blits the
+    //    silhouette a few thousand times, and a small crop makes that fast.
+    const { width: W, height: H } = src;
+    const data = srcCtx.getImageData(0, 0, W, H).data;
+    let minX = W, minY = H, maxX = -1, maxY = -1;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        if (data[(y * W + x) * 4 + 3] > 0) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < 0) return; // empty layer — nothing to outline
+    const bw = maxX - minX + 1;
+    const bh = maxY - minY + 1;
+
+    // 2. Crop the pixels (8-arg drawImage = source-rect copy)
+    const crop = document.createElement('canvas');
+    crop.width = bw;
+    crop.height = bh;
+    crop.getContext('2d')?.drawImage(src, minX, minY, bw, bh, 0, 0, bw, bh);
+
+    // 3. White silhouette of the crop: paint white THROUGH its alpha.
+    //    'source-in' keeps only where the destination is opaque, recolored
+    //    to the fill — exactly the tinting we need (see mode-toggle: this
+    //    is why the stamps come out white instead of image-colored).
+    const silhouette = document.createElement('canvas');
+    silhouette.width = bw;
+    silhouette.height = bh;
+    const silCtx = silhouette.getContext('2d');
+    if (!silCtx) return;
+    silCtx.drawImage(crop, 0, 0);
+    silCtx.globalCompositeOperation = 'source-in';
+    silCtx.fillStyle = '#ffffff';
+    silCtx.fillRect(0, 0, bw, bh);
+    silCtx.globalCompositeOperation = 'source-over';
+
+    // 4. Dilate: stamp the silhouette around circles r = 1..strokeWidth.
+    //    Every integer radius is needed — stamping only the outermost circle
+    //    misses pinch points in concave shapes (a "C" would plug up wrong).
+    //    Angle steps keep the gap between stamps ≈1px so the union is solid;
+    //    offsets are rounded to whole pixels (subpixel blits would only be
+    //    slower, and the union hides the jitter).
+    const R = strokeWidth;
+    const dilated = document.createElement('canvas');
+    dilated.width = bw + 2 * R;
+    dilated.height = bh + 2 * R;
+    const dilCtx = dilated.getContext('2d');
+    if (!dilCtx) return;
+    for (let r = 1; r <= R; r++) {
+      const steps = Math.max(8, Math.ceil(2 * Math.PI * r));
+      for (let i = 0; i < steps; i++) {
+        const angle = (i / steps) * 2 * Math.PI;
+        dilCtx.drawImage(
+          silhouette,
+          R + Math.round(Math.cos(angle) * r),
+          R + Math.round(Math.sin(angle) * r)
+        );
+      }
+    }
+
+    // 5. The original pixels go back on top — white shows only AROUND them
+    dilCtx.drawImage(crop, R, R);
+
+    // 6. Write back into the layer. drawImage BLENDS, so clear first or the
+    //    old pixels ghost underneath (see gotchas).
+    srcCtx.clearRect(0, 0, W, H);
+    srcCtx.drawImage(dilated, minX - R, minY - R);
+
+    // 7. Image layers: bounds must track the new silhouette or one-click
+    //    select would cover only the pre-sticker area. The stroke grows the
+    //    bbox by exactly R on each side (clamped by the canvas edges).
+    if (layer.kind === 'Image') {
+      const bx = Math.max(0, minX - R);
+      const by = Math.max(0, minY - R);
+      const next = layersRef.current.map((l) =>
+        l.id === layer.id
+          ? {
+              ...l,
+              bounds: {
+                x: bx,
+                y: by,
+                width: Math.min(W, maxX + R + 1) - bx,
+                height: Math.min(H, maxY + R + 1) - by,
+              },
+            }
+          : l
+      );
+      layersRef.current = next;
+      setLayers(next);
+    }
+
+    composite();
+    // Stickerizing is an action — make it undoable
+    pushSnapshot();
+  };
+
   // --- LAYER OPERATIONS (from the panel) ---
   const activateLayer = (id: string) => {
     setActiveLayerId(id);
@@ -1261,6 +1385,8 @@ export function ImageCanvas() {
           hasSelection={!!selection}
           onExport={exportCanvas}
         />
+        {/* Stickerize: white outline around the active layer's opaque pixels */}
+        <StickerizeMenu onStickerize={stickerizeLayer} />
         <Button variant="secondary" size='icon-sm' onClick={undo} disabled={historyInfo.index <= 0}>
          <Undo/>
         </Button>
