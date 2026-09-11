@@ -2,6 +2,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { useHotkey, useKeyHold } from '@tanstack/react-hotkeys';
 import { Button } from '#/components/ui/button';
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from '#/components/ui/context-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '#/components/ui/tooltip';
 import { Eraser } from './eraser';
 import { Arrow } from './arrow';
@@ -13,11 +19,14 @@ import { Plus } from './plus';
 import { Trash } from './trash';
 import { Load } from './load';
 import { ExportMenu } from './export-menu';
+import { ColorPickerMenu } from './color-picker-menu';
 import { StickerizeMenu } from './stickerize-menu';
 import { LayersPanel, type Layer, type LayerKind } from './LayersPanel';
-import { Layers as LayersIcon } from 'lucide-react';
+import { Layers as LayersIcon, Lasso } from 'lucide-react';
 
-type Tool = 'brush' | 'eraser' | 'select';
+type Tool = 'brush' | 'eraser' | 'select' | 'polyline';
+
+type Point = { x: number; y: number };
 
 type Handle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
@@ -69,6 +78,7 @@ export function ImageCanvas() {
   // Tool + brush settings live in state because they're UI (we render them)
   const [tool, setTool] = useState<Tool>('brush');
   const [brushSize, setBrushSize] = useState(20);
+  const [brushColor, setBrushColor] = useState('#000000');
 
   // --- LAYERS ---
   // Each layer owns an OFFSCREEN canvas with its own pixels. The main
@@ -119,7 +129,11 @@ export function ImageCanvas() {
     ctx.globalCompositeOperation = 'source-over';
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     for (const layer of layersRef.current) {
-      if (layer.visible) ctx.drawImage(layer.canvas, 0, 0);
+      if (!layer.visible) continue;
+      // Sticker stroke first (it grows OUTWARD from the pixels, so the
+      // layer's own pixels must paint on top of it)
+      if (layer.stroke) ctx.drawImage(layer.stroke.canvas, 0, 0);
+      ctx.drawImage(layer.canvas, 0, 0);
     }
 
     // Bump so layer thumbnails re-render with the new pixels
@@ -210,7 +224,54 @@ export function ImageCanvas() {
     orig: Rect;
     layerId: string; // the layer the pixels were lifted from
     isImageSelect: boolean; // true = created by one-click image selection
+    // When the lifted layer has a stickerize stroke, its pixels ride along
+    // (same rects as base/region) so transforms move stroke + content
+    // together instead of leaving the stroke behind.
+    strokeBase?: HTMLCanvasElement;
+    strokeRegion?: HTMLCanvasElement;
+    // Polygon selections (polyline tool): the vertices in DOCUMENT coords
+    // at lift time. `selection` stays the bounding box that the existing
+    // rect machinery moves around; the ants are drawn from these points
+    // translated by (selection - orig).
+    polygon?: Point[];
   } | null>(null);
+
+  // Canvas right-click menu. CONTROLLED, and gated on `selection` — the
+  // menu content can't just mount/unmount on `selection` alone, because
+  // Base UI's root keeps its own `open` flag: if the content unmounts
+  // while open (delete, click-away), the flag never resets, and the next
+  // selection would pop the menu open with no right-click at all.
+  const [canvasMenuOpen, setCanvasMenuOpen] = useState(false);
+
+  // --- POLYLINE (point-to-point polygon lasso) ---
+  // In-progress vertices, in document coords. The rubber band to the
+  // cursor is drawn imperatively on the overlay (polyCursorRef) so mouse
+  // moves don't round-trip through React state.
+  const [polyPoints, setPolyPoints] = useState<Point[] | null>(null);
+  const polyCursorRef = useRef<Point | null>(null);
+
+  // Polyline keyboard: Enter closes the polygon, Escape cancels. Bound
+  // only while a polygon is in progress (the effect re-runs per change,
+  // so the closures always see the current points).
+  useEffect(() => {
+    if (!polyPoints) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setPolyPoints(null);
+        polyCursorRef.current = null;
+      } else if (e.key === 'Enter') {
+        completePolygon();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [polyPoints]);
+
+  // --- STICKERIZE ---
+  // The stroke lives on the LAYER (layer.stroke), not in a side map: it
+  // can't be corrupted by edits, so "Remove stroke" always strips ALL of
+  // it and re-stickerizing never stacks widths (each run recomputes from
+  // the layer's current pixels).
 
   // Hover-aware cursors: the overlay (placement) and base canvas
   // (selection) switch their cursor based on what's under the pointer —
@@ -272,19 +333,46 @@ export function ImageCanvas() {
     }
 
     if (selection) {
-      // Dashed border = the classic "marching ants" (a static version)
+      // Dashed border = the classic "marching ants" (a static version).
+      // Polygon selections draw their outline instead of the bbox rect —
+      // the bbox would misrepresent what's actually selected.
+      const poly = displayedPolyPoints();
       ctx.strokeStyle = '#3b82f6';
       ctx.lineWidth = 1;
       ctx.setLineDash([6, 4]);
-      ctx.strokeRect(selection.x + 0.5, selection.y + 0.5, selection.width, selection.height);
+      if (poly) {
+        ctx.beginPath();
+        poly.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+        ctx.closePath();
+        ctx.stroke();
+      } else {
+        ctx.strokeRect(selection.x + 0.5, selection.y + 0.5, selection.width, selection.height);
+        drawHandles(ctx, selection);
+      }
       ctx.setLineDash([]);
-      drawHandles(ctx, selection);
+    }
+
+    // In-progress polyline: committed segments + rubber band to the cursor.
+    // The first vertex gets a marker — larger once the polygon can close.
+    if (polyPoints && polyPoints.length > 0) {
+      ctx.strokeStyle = '#3b82f6';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(polyPoints[0].x, polyPoints[0].y);
+      for (let i = 1; i < polyPoints.length; i++) ctx.lineTo(polyPoints[i].x, polyPoints[i].y);
+      const cursor = polyCursorRef.current;
+      if (cursor) ctx.lineTo(cursor.x, cursor.y);
+      ctx.stroke();
+      ctx.fillStyle = '#3b82f6';
+      ctx.beginPath();
+      ctx.arc(polyPoints[0].x, polyPoints[0].y, polyPoints.length >= 3 ? 4 : 2.5, 0, 2 * Math.PI);
+      ctx.fill();
     }
   };
 
   useEffect(() => {
     drawOverlay();
-  }, [placement, selection]);
+  }, [placement, selection, polyPoints]);
 
   // useRef mirrors of tool/size: the mousemove handler needs the CURRENT
   // value during a stroke, but re-creating the handler each render is fine
@@ -292,8 +380,10 @@ export function ImageCanvas() {
   // later, mirror them in refs to avoid stale closures.
   const toolRef = useRef(tool);
   const brushSizeRef = useRef(brushSize);
+  const brushColorRef = useRef(brushColor);
   toolRef.current = tool;
   brushSizeRef.current = brushSize;
+  brushColorRef.current = brushColor;
 
   // --- UNDO / REDO HISTORY ---
   // A snapshot captures the WHOLE layer stack: each layer's pixels
@@ -308,6 +398,9 @@ export function ImageCanvas() {
     locked: boolean;
     bounds?: Rect;
     data: ImageData;
+    // Sticker stroke pixels + width (absent = no stroke). Part of the
+    // snapshot so undo/redo restores stickerized layers exactly.
+    stroke?: { width: number; data: ImageData };
   };
   type Snapshot = { layers: LayerSnapshot[]; activeId: string | null };
 
@@ -332,6 +425,7 @@ export function ImageCanvas() {
       activeId: activeLayerIdRef.current,
       layers: layersRef.current.map((layer) => {
         const lctx = layer.canvas.getContext('2d');
+        const sctx = layer.stroke?.canvas.getContext('2d');
         return {
           id: layer.id,
           name: layer.name,
@@ -340,6 +434,17 @@ export function ImageCanvas() {
           locked: layer.locked,
           bounds: layer.bounds,
           data: lctx!.getImageData(0, 0, layer.canvas.width, layer.canvas.height),
+          stroke: layer.stroke
+            ? {
+                width: layer.stroke.width,
+                data: sctx!.getImageData(
+                  0,
+                  0,
+                  layer.stroke.canvas.width,
+                  layer.stroke.canvas.height
+                ),
+              }
+            : undefined,
         };
       }),
     });
@@ -378,6 +483,17 @@ export function ImageCanvas() {
       canvas.width = s.data.width;
       canvas.height = s.data.height;
       canvas.getContext('2d')?.putImageData(s.data, 0, 0);
+
+      // Rebuild the sticker stroke, if this snapshot had one
+      let stroke: Layer['stroke'];
+      if (s.stroke) {
+        const strokeCanvas = document.createElement('canvas');
+        strokeCanvas.width = s.stroke.data.width;
+        strokeCanvas.height = s.stroke.data.height;
+        strokeCanvas.getContext('2d')?.putImageData(s.stroke.data, 0, 0);
+        stroke = { width: s.stroke.width, canvas: strokeCanvas };
+      }
+
       return {
         id: s.id,
         name: s.name,
@@ -385,6 +501,7 @@ export function ImageCanvas() {
         visible: s.visible,
         locked: s.locked,
         bounds: s.bounds,
+        stroke,
         canvas,
       };
     });
@@ -440,7 +557,7 @@ export function ImageCanvas() {
     } else {
       // source-over: normal painting (the default)
       ctx.globalCompositeOperation = 'source-over';
-      ctx.strokeStyle = 'black';
+      ctx.strokeStyle = brushColorRef.current;
     }
   };
 
@@ -578,6 +695,8 @@ export function ImageCanvas() {
   };
 
   const handleOverlayMouseDown = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    // Same rule as the base canvas: only the main button drags
+    if (event.button !== 0) return;
     const p = placement;
     if (!p) return;
     const { x, y } = getCanvasCoords(event);
@@ -663,6 +782,42 @@ export function ImageCanvas() {
   const selTargetLayer = (): Layer | null =>
     layersRef.current.find((l) => l.id === selRef.current?.layerId) ?? null;
 
+  // Polygon selections: the vertices as they sit NOW (lift points + however
+  // far the bbox has been dragged). Null for rect selections.
+  const displayedPolyPoints = (): Point[] | null => {
+    const sel = selRef.current;
+    if (!sel?.polygon || !selection) return null;
+    const dx = selection.x - sel.orig.x;
+    const dy = selection.y - sel.orig.y;
+    return sel.polygon.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+  };
+
+  // Even-odd ray casting: is (x, y) inside the polygon?
+  const pointInPolygon = (pts: Point[], x: number, y: number): boolean => {
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const xi = pts[i].x, yi = pts[i].y;
+      const xj = pts[j].x, yj = pts[j].y;
+      const crosses = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
+      if (crosses) inside = !inside;
+    }
+    return inside;
+  };
+
+  // Erase EXACTLY a polygon shape (destination-out fill). Used anywhere a
+  // polygon-shaped hole is needed: the lift (redrawSelection) and delete.
+  // Erasing the bbox instead would wipe everything between the polygon
+  // and its box — pixels the user never selected.
+  const erasePolygonShape = (ctx: CanvasRenderingContext2D, pts: Point[]) => {
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = '#000'; // color ignored; only the shape matters
+    ctx.beginPath();
+    pts.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  };
+
   // --- ONE-CLICK IMAGE SELECT ---
   // Topmost-first hit test over visible, unlocked Image layers: the click
   // must be inside the layer's bounds AND on an opaque pixel (transparent
@@ -675,10 +830,15 @@ export function ImageCanvas() {
       const b = layer.bounds;
       if (x < b.x || x > b.x + b.width || y < b.y || y > b.y + b.height) continue;
 
-      // Sample the actual pixel — bounds alone would catch transparent holes
+      // Sample the actual pixel — bounds alone would catch transparent
+      // holes. The sticker stroke counts too: it's visually part of the
+      // sticker, so clicking it should select the image.
       const alpha =
         layer.canvas.getContext('2d')?.getImageData(Math.floor(x), Math.floor(y), 1, 1).data[3] ?? 0;
-      if (alpha > 0) return layer;
+      const strokeAlpha = layer.stroke
+        ? layer.stroke.canvas.getContext('2d')?.getImageData(Math.floor(x), Math.floor(y), 1, 1).data[3] ?? 0
+        : 0;
+      if (alpha > 0 || strokeAlpha > 0) return layer;
     }
     return null;
   };
@@ -700,16 +860,147 @@ export function ImageCanvas() {
       .getContext('2d')
       ?.drawImage(layer.canvas, bounds.x, bounds.y, bounds.width, bounds.height, 0, 0, bounds.width, bounds.height);
 
+    // Stickerized layer: lift the stroke with the same rects so transforms
+    // move stroke + content as one
+    let strokeBase: HTMLCanvasElement | undefined;
+    let strokeRegion: HTMLCanvasElement | undefined;
+    if (layer.stroke) {
+      strokeBase = document.createElement('canvas');
+      strokeBase.width = layer.stroke.canvas.width;
+      strokeBase.height = layer.stroke.canvas.height;
+      strokeBase.getContext('2d')?.drawImage(layer.stroke.canvas, 0, 0);
+
+      strokeRegion = document.createElement('canvas');
+      strokeRegion.width = bounds.width;
+      strokeRegion.height = bounds.height;
+      strokeRegion
+        .getContext('2d')
+        ?.drawImage(layer.stroke.canvas, bounds.x, bounds.y, bounds.width, bounds.height, 0, 0, bounds.width, bounds.height);
+    }
+
     selRef.current = {
       base,
       region,
       orig: { ...bounds },
       layerId: layer.id,
       isImageSelect: true,
+      strokeBase,
+      strokeRegion,
     };
     // Clicking an image also activates its layer (paint would target it)
     setActiveLayerId(layer.id);
     setSelection({ ...bounds });
+  };
+
+  // --- POLYLINE (point-to-point polygon lasso) ---
+  // Click adds a vertex; clicking near the first vertex (or pressing Enter)
+  // closes the polygon and lifts it as a floating selection. Escape cancels.
+  const handlePolylineMouseDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const layer = activeLayer();
+    if (!layer || layer.locked) return;
+    const { x, y } = getCanvasCoords(event);
+
+    if (!polyPoints) {
+      setPolyPoints([{ x, y }]);
+      polyCursorRef.current = { x, y };
+      return;
+    }
+
+    // Click near the first vertex with a closeable polygon = close it
+    if (polyPoints.length >= 3) {
+      const first = polyPoints[0];
+      if (Math.hypot(x - first.x, y - first.y) <= 8) {
+        completePolygon();
+        return;
+      }
+    }
+    setPolyPoints([...polyPoints, { x, y }]);
+  };
+
+  // Close the polygon: lift the pixels inside it as a floating selection.
+  // The region is the polygon's bbox crop MASKED to the polygon shape
+  // ('destination-in' keeps only pixels inside the path) — so the existing
+  // rect machinery (redrawSelection's stash-lift-drop) automatically leaves
+  // a polygon-shaped hole in the layer and moves polygon-shaped pixels.
+  const completePolygon = () => {
+    const layer = activeLayer();
+    if (!layer || layer.locked || !polyPoints || polyPoints.length < 3) {
+      setPolyPoints(null); // too few points — just discard
+      return;
+    }
+
+    const xs = polyPoints.map((p) => p.x);
+    const ys = polyPoints.map((p) => p.y);
+    const rect: Rect = {
+      x: Math.floor(Math.min(...xs)),
+      y: Math.floor(Math.min(...ys)),
+      width: 0,
+      height: 0,
+    };
+    rect.width = Math.ceil(Math.max(...xs)) - rect.x;
+    rect.height = Math.ceil(Math.max(...ys)) - rect.y;
+
+    // Mask a canvas to the polygon (coords relative to the bbox)
+    const maskWithPolygon = (target: HTMLCanvasElement) => {
+      const tctx = target.getContext('2d');
+      if (!tctx) return;
+      tctx.globalCompositeOperation = 'destination-in';
+      tctx.fillStyle = '#000'; // color ignored; only the shape matters
+      tctx.beginPath();
+      polyPoints.forEach((p, i) =>
+        i === 0 ? tctx.moveTo(p.x - rect.x, p.y - rect.y) : tctx.lineTo(p.x - rect.x, p.y - rect.y)
+      );
+      tctx.closePath();
+      tctx.fill();
+      tctx.globalCompositeOperation = 'source-over';
+    };
+
+    const base = document.createElement('canvas');
+    base.width = layer.canvas.width;
+    base.height = layer.canvas.height;
+    base.getContext('2d')?.drawImage(layer.canvas, 0, 0);
+
+    const region = document.createElement('canvas');
+    region.width = rect.width;
+    region.height = rect.height;
+    region
+      .getContext('2d')
+      ?.drawImage(layer.canvas, rect.x, rect.y, rect.width, rect.height, 0, 0, rect.width, rect.height);
+    maskWithPolygon(region);
+
+    // Stroke ride-along: same rects, same polygon mask
+    let strokeBase: HTMLCanvasElement | undefined;
+    let strokeRegion: HTMLCanvasElement | undefined;
+    if (layer.stroke) {
+      strokeBase = document.createElement('canvas');
+      strokeBase.width = layer.stroke.canvas.width;
+      strokeBase.height = layer.stroke.canvas.height;
+      strokeBase.getContext('2d')?.drawImage(layer.stroke.canvas, 0, 0);
+
+      strokeRegion = document.createElement('canvas');
+      strokeRegion.width = rect.width;
+      strokeRegion.height = rect.height;
+      strokeRegion
+        .getContext('2d')
+        ?.drawImage(layer.stroke.canvas, rect.x, rect.y, rect.width, rect.height, 0, 0, rect.width, rect.height);
+      maskWithPolygon(strokeRegion);
+    }
+
+    selRef.current = {
+      base,
+      region,
+      orig: rect,
+      layerId: layer.id,
+      isImageSelect: false,
+      polygon: polyPoints.map((p) => ({ ...p })),
+      strokeBase,
+      strokeRegion,
+    };
+    setPolyPoints(null);
+    polyCursorRef.current = null;
+    setSelection(rect);
+    // Lifts the pixels: stash - bbox + masked region back in place
+    redrawSelection(rect);
   };
 
   // Redraws the source layer during a selection transform:
@@ -727,8 +1018,30 @@ export function ImageCanvas() {
     lctx.globalCompositeOperation = 'source-over';
     lctx.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
     lctx.drawImage(sel.base, 0, 0);
-    lctx.clearRect(sel.orig.x, sel.orig.y, sel.orig.width, sel.orig.height);
+    // The hole is the LIFTED shape at its original position — for polygons
+    // that's the polygon itself, NOT its bbox (the bbox would also wipe
+    // the unselected pixels between the shape and its box)
+    if (sel.polygon) {
+      erasePolygonShape(lctx, sel.polygon);
+    } else {
+      lctx.clearRect(sel.orig.x, sel.orig.y, sel.orig.width, sel.orig.height);
+    }
     lctx.drawImage(sel.region, rect.x, rect.y, rect.width, rect.height);
+
+    // The stroke rides along: identical rewrite (stash, lift, drop) so
+    // stroke and pixels stay aligned during and after the transform
+    const sctx = layer.stroke?.canvas.getContext('2d');
+    if (layer.stroke && sctx && sel.strokeBase && sel.strokeRegion) {
+      sctx.globalCompositeOperation = 'source-over';
+      sctx.clearRect(0, 0, layer.stroke.canvas.width, layer.stroke.canvas.height);
+      sctx.drawImage(sel.strokeBase, 0, 0);
+      if (sel.polygon) {
+        erasePolygonShape(sctx, sel.polygon);
+      } else {
+        sctx.clearRect(sel.orig.x, sel.orig.y, sel.orig.width, sel.orig.height);
+      }
+      sctx.drawImage(sel.strokeRegion, rect.x, rect.y, rect.width, rect.height);
+    }
 
     composite();
   };
@@ -766,6 +1079,13 @@ export function ImageCanvas() {
       lctx.globalCompositeOperation = 'source-over';
       lctx.clearRect(0, 0, layer!.canvas.width, layer!.canvas.height);
       lctx.drawImage(sel.base, 0, 0);
+      // Stroke too, if one was lifted with the selection
+      const sctx = layer!.stroke?.canvas.getContext('2d');
+      if (layer!.stroke && sctx && sel.strokeBase) {
+        sctx.globalCompositeOperation = 'source-over';
+        sctx.clearRect(0, 0, layer!.stroke.canvas.width, layer!.stroke.canvas.height);
+        sctx.drawImage(sel.strokeBase, 0, 0);
+      }
       composite();
     }
     selRef.current = null;
@@ -777,16 +1097,27 @@ export function ImageCanvas() {
 
     // Already have a selection? Check for handle/body grabs first.
     if (selection && selRef.current) {
-      const handle = hitTestHandle(selection, x, y);
-      const inside =
-        x >= selection.x && x <= selection.x + selection.width &&
-        y >= selection.y && y <= selection.y + selection.height;
-      if (handle || inside) {
-        dragRef.current = { mode: handle ?? 'move', startX: x, startY: y, orig: { ...selection } };
-        return;
+      const poly = displayedPolyPoints();
+      if (poly) {
+        // Polygon selections move but don't resize — no handles to hit
+        if (pointInPolygon(poly, x, y)) {
+          dragRef.current = { mode: 'move', startX: x, startY: y, orig: { ...selection } };
+          return;
+        }
+        // Clicked outside: commit the current transform, then re-target
+        commitSelection();
+      } else {
+        const handle = hitTestHandle(selection, x, y);
+        const inside =
+          x >= selection.x && x <= selection.x + selection.width &&
+          y >= selection.y && y <= selection.y + selection.height;
+        if (handle || inside) {
+          dragRef.current = { mode: handle ?? 'move', startX: x, startY: y, orig: { ...selection } };
+          return;
+        }
+        // Clicked outside: commit the current transform, then re-target
+        commitSelection();
       }
-      // Clicked outside: commit the current transform, then re-target
-      commitSelection();
     }
 
     // ONE-CLICK IMAGE SELECT: clicking an image grabs the whole image —
@@ -856,7 +1187,25 @@ export function ImageCanvas() {
       .getContext('2d')
       ?.drawImage(layer.canvas, selection.x, selection.y, selection.width, selection.height, 0, 0, selection.width, selection.height);
 
-    selRef.current = { base, region, orig: { ...selection }, layerId: layer.id, isImageSelect: false };
+    // Stickerized layer: lift the stroke within the marquee too, so the
+    // transform moves stroke + pixels together
+    let strokeBase: HTMLCanvasElement | undefined;
+    let strokeRegion: HTMLCanvasElement | undefined;
+    if (layer.stroke) {
+      strokeBase = document.createElement('canvas');
+      strokeBase.width = layer.stroke.canvas.width;
+      strokeBase.height = layer.stroke.canvas.height;
+      strokeBase.getContext('2d')?.drawImage(layer.stroke.canvas, 0, 0);
+
+      strokeRegion = document.createElement('canvas');
+      strokeRegion.width = selection.width;
+      strokeRegion.height = selection.height;
+      strokeRegion
+        .getContext('2d')
+        ?.drawImage(layer.stroke.canvas, selection.x, selection.y, selection.width, selection.height, 0, 0, selection.width, selection.height);
+    }
+
+    selRef.current = { base, region, orig: { ...selection }, layerId: layer.id, isImageSelect: false, strokeBase, strokeRegion };
     redrawSelection(selection);
   };
 
@@ -866,6 +1215,11 @@ export function ImageCanvas() {
   // shared helpers like getCanvasCoords work unchanged). Pointer events
   // carry a pointerId, which setPointerCapture needs.
   const handleMouseDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    // Only the MAIN button starts tools. Right-click must fall through to
+    // the context menu — a pointerdown here would start a marquee that
+    // commits as a tiny "click" selection on pointerup, wiping the
+    // existing selection right before the menu opens.
+    if (event.button !== 0) return;
     // Pan mode takes priority over every tool
     if (isPanningRef.current) {
       const viewport = viewportRef.current;
@@ -888,6 +1242,12 @@ export function ImageCanvas() {
     // Select tool takes over the base canvas events entirely
     if (toolRef.current === 'select') {
       handleSelectMouseDown(event);
+      return;
+    }
+
+    // Polyline tool: clicks add vertices (see handlePolylineMouseDown)
+    if (toolRef.current === 'polyline') {
+      handlePolylineMouseDown(event);
       return;
     }
 
@@ -928,11 +1288,17 @@ export function ImageCanvas() {
       if (!dragRef.current) {
         if (selection) {
           const { x, y } = getCanvasCoords(event);
-          const handle = hitTestHandle(selection, x, y);
-          const inside =
-            x >= selection.x && x <= selection.x + selection.width &&
-            y >= selection.y && y <= selection.y + selection.height;
-          setCanvasCursor(handle ? HANDLE_CURSOR[handle] : inside ? 'move' : ARROW_CURSOR);
+          const poly = displayedPolyPoints();
+          if (poly) {
+            // Polygon selections have no resize handles — just move
+            setCanvasCursor(pointInPolygon(poly, x, y) ? 'move' : ARROW_CURSOR);
+          } else {
+            const handle = hitTestHandle(selection, x, y);
+            const inside =
+              x >= selection.x && x <= selection.x + selection.width &&
+              y >= selection.y && y <= selection.y + selection.height;
+            setCanvasCursor(handle ? HANDLE_CURSOR[handle] : inside ? 'move' : ARROW_CURSOR);
+          }
         } else {
           // Hovering an image with the select tool = it's one click away
           // from being selected — advertise that with the move cursor
@@ -941,6 +1307,16 @@ export function ImageCanvas() {
         }
       }
       handleSelectMouseMove(event);
+      return;
+    }
+
+    // Polyline tool: track the cursor for the rubber band. This redraws
+    // the overlay IMPERATIVELY — per-move state updates would re-render
+    // the whole component 60fps (see hybrid-pattern gotchas).
+    if (toolRef.current === 'polyline') {
+      const { x, y } = getCanvasCoords(event);
+      polyCursorRef.current = { x, y };
+      drawOverlay();
       return;
     }
 
@@ -970,6 +1346,12 @@ export function ImageCanvas() {
 
     if (!isDrawingRef.current) return;
     isDrawingRef.current = false;
+    // Reset the composite mode NOW, not at the next stroke's setupTool.
+    // The eraser leaves 'destination-out' stuck on the layer ctx, and any
+    // drawImage that runs before the next setupTool would ERASE instead
+    // of paint. Stroke end is the natural reset point.
+    const endedCtx = activeLayer()?.canvas.getContext('2d');
+    if (endedCtx) endedCtx.globalCompositeOperation = 'source-over';
     // The stroke is complete — commit it to history
     pushSnapshot();
   };
@@ -1030,9 +1412,12 @@ export function ImageCanvas() {
   };
 
   // Switching tools commits any in-progress selection, so a brush stroke
-  // can never paint underneath a floating region.
+  // can never paint underneath a floating region. An in-progress polygon
+  // dies with the switch — it was never a selection yet.
   const changeTool = (t: Tool) => {
     if (selRef.current) commitSelection();
+    setPolyPoints(null);
+    polyCursorRef.current = null;
     setTool(t);
   };
 
@@ -1079,6 +1464,12 @@ export function ImageCanvas() {
     if (!layer || layer.locked) return;
     const ctx = layer.canvas.getContext('2d');
     ctx?.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
+    // Nothing left to outline — drop the sticker with the pixels
+    const next = layersRef.current.map((l) =>
+      l.id === layer.id ? { ...l, stroke: undefined } : l
+    );
+    layersRef.current = next;
+    setLayers(next);
     composite();
     // Clearing is an action too — make it undoable
     pushSnapshot();
@@ -1089,28 +1480,20 @@ export function ImageCanvas() {
   // follows the layer's ALPHA silhouette (erased areas get no stroke), not
   // the canvas rect — so it hugs whatever shape remains after cleanup.
   //
-  // How the outline is grown: in morphology terms we need a DILATION of the
-  // silhouette by a disc of radius `strokeWidth`. A disc = every offset
-  // vector of length <= r, and dilation = the union of the shape translated
-  // by each of those offsets. So: stamp the white silhouette at every point
-  // of circles r = 1..strokeWidth and the union of the stamps is the
-  // silhouette grown outward with a rounded edge.
-  const stickerizeLayer = (strokeWidth: number) => {
-    if (strokeWidth <= 0) return;
-    // Rewrites the whole layer, so a floating piece must land first
-    if (selRef.current) commitSelection();
-
-    const layer = activeLayer();
-    if (!layer || layer.locked) return;
-    const src = layer.canvas;
-    const srcCtx = src.getContext('2d');
-    if (!srcCtx) return;
-
-    // 1. Tight bounding box of non-transparent pixels. We work on the crop,
-    //    not the full 800x600 canvas — the stamping loop below blits the
-    //    silhouette a few thousand times, and a small crop makes that fast.
-    const { width: W, height: H } = src;
-    const data = srcCtx.getImageData(0, 0, W, H).data;
+  // The stroke lives on layer.stroke (a separate canvas), NOT baked into
+  // layer.canvas. That's what makes remove/re-stickerize well-defined:
+  // edits only ever touch layer.canvas, so the stroke is always fully
+  // strippable and every stickerize recomputes from the true pixels —
+  // widths replace instead of stacking, no bookkeeping to corrupt.
+  //
+  // Tight bounding box of non-transparent pixels, or null when the canvas
+  // is empty. Shared by stickerize, remove-stroke, and selection delete
+  // (all of which need to recompute bounds after pixels change).
+  const scanBounds = (canvas: HTMLCanvasElement) => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    const { width: W, height: H } = canvas;
+    const data = ctx.getImageData(0, 0, W, H).data;
     let minX = W, minY = H, maxX = -1, maxY = -1;
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
@@ -1122,66 +1505,109 @@ export function ImageCanvas() {
         }
       }
     }
-    if (maxX < 0) return; // empty layer — nothing to outline
+    return maxX < 0 ? null : { minX, minY, maxX, maxY };
+  };
+
+  // Grows a white outline around the layer's CURRENT opaque pixels and
+  // returns it as a full-size stroke canvas, plus the content bbox so
+  // callers can update bounds. Null when the layer has no pixels.
+  //
+  // How the outline is grown: in morphology terms we need a DILATION of the
+  // silhouette by a disc of radius `width`. A disc = every offset vector of
+  // length <= r, and dilation = the union of the shape translated by each
+  // of those offsets. So: stamp the white silhouette at every point of
+  // circles r = 1..width and the union of the stamps is the silhouette
+  // grown outward with a rounded edge.
+  const buildStrokeCanvas = (
+    layer: Pick<Layer, 'canvas'>,
+    width: number
+  ): { canvas: HTMLCanvasElement; minX: number; minY: number; maxX: number; maxY: number } | null => {
+    const src = layer.canvas;
+    const srcCtx = src.getContext('2d');
+    if (!srcCtx || width <= 0) return null;
+
+    // Tight bounding box of non-transparent pixels. We work on the crop,
+    // not the full 800x600 canvas — the stamping loop below blits the
+    // silhouette a few thousand times, and a small crop makes that fast.
+    const bounds = scanBounds(src);
+    if (!bounds) return null; // empty layer — nothing to outline
+    const { minX, minY, maxX, maxY } = bounds;
     const bw = maxX - minX + 1;
     const bh = maxY - minY + 1;
 
-    // 2. Crop the pixels (8-arg drawImage = source-rect copy)
+    // Crop the pixels (8-arg drawImage = source-rect copy)
     const crop = document.createElement('canvas');
     crop.width = bw;
     crop.height = bh;
     crop.getContext('2d')?.drawImage(src, minX, minY, bw, bh, 0, 0, bw, bh);
 
-    // 3. White silhouette of the crop: paint white THROUGH its alpha.
-    //    'source-in' keeps only where the destination is opaque, recolored
-    //    to the fill — exactly the tinting we need (see mode-toggle: this
-    //    is why the stamps come out white instead of image-colored).
+    // White silhouette of the crop: paint white THROUGH its alpha.
+    // 'source-in' keeps only where the destination is opaque, recolored
+    // to the fill — exactly the tinting we need (see mode-toggle: this
+    // is why the stamps come out white instead of image-colored).
     const silhouette = document.createElement('canvas');
     silhouette.width = bw;
     silhouette.height = bh;
     const silCtx = silhouette.getContext('2d');
-    if (!silCtx) return;
+    if (!silCtx) return null;
     silCtx.drawImage(crop, 0, 0);
     silCtx.globalCompositeOperation = 'source-in';
     silCtx.fillStyle = '#ffffff';
     silCtx.fillRect(0, 0, bw, bh);
     silCtx.globalCompositeOperation = 'source-over';
 
-    // 4. Dilate: stamp the silhouette around circles r = 1..strokeWidth.
-    //    Every integer radius is needed — stamping only the outermost circle
-    //    misses pinch points in concave shapes (a "C" would plug up wrong).
-    //    Angle steps keep the gap between stamps ≈1px so the union is solid;
-    //    offsets are rounded to whole pixels (subpixel blits would only be
-    //    slower, and the union hides the jitter).
-    const R = strokeWidth;
+    // Dilate: stamp the silhouette around circles r = 1..width. Every
+    // integer radius is needed — stamping only the outermost circle misses
+    // pinch points in concave shapes (a "C" would plug up wrong). Angle
+    // steps keep the gap between stamps ≈1px so the union is solid; offsets
+    // are rounded to whole pixels (subpixel blits would only be slower,
+    // and the union hides the jitter).
     const dilated = document.createElement('canvas');
-    dilated.width = bw + 2 * R;
-    dilated.height = bh + 2 * R;
+    dilated.width = bw + 2 * width;
+    dilated.height = bh + 2 * width;
     const dilCtx = dilated.getContext('2d');
-    if (!dilCtx) return;
-    for (let r = 1; r <= R; r++) {
+    if (!dilCtx) return null;
+    for (let r = 1; r <= width; r++) {
       const steps = Math.max(8, Math.ceil(2 * Math.PI * r));
       for (let i = 0; i < steps; i++) {
         const angle = (i / steps) * 2 * Math.PI;
         dilCtx.drawImage(
           silhouette,
-          R + Math.round(Math.cos(angle) * r),
-          R + Math.round(Math.sin(angle) * r)
+          width + Math.round(Math.cos(angle) * r),
+          width + Math.round(Math.sin(angle) * r)
         );
       }
     }
 
-    // 5. The original pixels go back on top — white shows only AROUND them
-    dilCtx.drawImage(crop, R, R);
+    // Full-size stroke canvas, positioned to match the layer's pixels.
+    // The layer's own pixels are NOT copied in — composite() draws the
+    // stroke canvas first and the pixels on top, which puts the white
+    // AROUND them. (The dilated union includes the silhouette area itself;
+    // that part hides beneath the pixels.)
+    const strokeCanvas = document.createElement('canvas');
+    strokeCanvas.width = src.width;
+    strokeCanvas.height = src.height;
+    strokeCanvas.getContext('2d')?.drawImage(dilated, minX - width, minY - width);
+    return { canvas: strokeCanvas, minX, minY, maxX, maxY };
+  };
 
-    // 6. Write back into the layer. drawImage BLENDS, so clear first or the
-    //    old pixels ghost underneath (see gotchas).
-    srcCtx.clearRect(0, 0, W, H);
-    srcCtx.drawImage(dilated, minX - R, minY - R);
+  const stickerizeLayer = (strokeWidth: number) => {
+    if (strokeWidth <= 0) return;
+    // Adds a stroke canvas; a floating piece must land first so the
+    // silhouette reflects the committed pixels
+    if (selRef.current) commitSelection();
 
-    // 7. Image layers: bounds must track the new silhouette or one-click
-    //    select would cover only the pre-sticker area. The stroke grows the
-    //    bbox by exactly R on each side (clamped by the canvas edges).
+    const layer = activeLayer();
+    if (!layer || layer.locked) return;
+    const built = buildStrokeCanvas(layer, strokeWidth);
+    if (!built) return; // empty layer — nothing to outline
+    const { canvas: strokeCanvas, minX, minY, maxX, maxY } = built;
+    const R = strokeWidth;
+    const { width: W, height: H } = layer.canvas;
+
+    // 6. Attach the stroke to the layer (replacing any previous one —
+    //    widths replace, never stack) and grow Image-layer bounds by R so
+    //    one-click select covers the stroke too (clamped by the edges).
     if (layer.kind === 'Image') {
       const bx = Math.max(0, minX - R);
       const by = Math.max(0, minY - R);
@@ -1189,6 +1615,7 @@ export function ImageCanvas() {
         l.id === layer.id
           ? {
               ...l,
+              stroke: { width: R, canvas: strokeCanvas },
               bounds: {
                 x: bx,
                 y: by,
@@ -1200,11 +1627,116 @@ export function ImageCanvas() {
       );
       layersRef.current = next;
       setLayers(next);
+    } else {
+      const next = layersRef.current.map((l) =>
+        l.id === layer.id ? { ...l, stroke: { width: R, canvas: strokeCanvas } } : l
+      );
+      layersRef.current = next;
+      setLayers(next);
     }
 
     composite();
     // Stickerizing is an action — make it undoable
     pushSnapshot();
+  };
+
+  // Strip the sticker: detach the stroke canvas entirely. Because the
+  // stroke never lived in the layer's pixels, this removes ALL of it —
+  // regardless of how many widths were applied or what edits happened
+  // since. Undoable like any other action.
+  const removeSticker = () => {
+    const layer = activeLayer();
+    if (!layer || layer.locked || !layer.stroke) return;
+
+    // Image layers: bounds shrink back to the actual pixels (the stroke
+    // margin is gone). Recompute from an alpha scan — bounds may be stale
+    // if pixels were transformed earlier.
+    if (layer.kind === 'Image') {
+      const scanned = scanBounds(layer.canvas);
+      const bounds = scanned
+        ? {
+            x: scanned.minX,
+            y: scanned.minY,
+            width: scanned.maxX - scanned.minX + 1,
+            height: scanned.maxY - scanned.minY + 1,
+          }
+        : undefined; // pixels were erased to nothing — no bounds to select
+      const next = layersRef.current.map((l) =>
+        l.id === layer.id ? { ...l, stroke: undefined, bounds } : l
+      );
+      layersRef.current = next;
+      setLayers(next);
+    } else {
+      const next = layersRef.current.map((l) =>
+        l.id === layer.id ? { ...l, stroke: undefined } : l
+      );
+      layersRef.current = next;
+      setLayers(next);
+    }
+
+    composite();
+    pushSnapshot();
+  };
+
+  // Delete the selected pixels: erase under the selection's CURRENT rect
+  // (it may have been dragged away from orig), discard the lifted region,
+  // and drop back to no-selection. Undoable like any other action.
+  const deleteSelection = () => {
+    const layer = selTargetLayer();
+    const sel = selRef.current;
+    if (!layer || !sel || !selection) return;
+    if (layer.locked) return; // lock refuses pixel edits
+    const lctx = layer.canvas.getContext('2d');
+    if (!lctx) return;
+
+    // Deletion is just transparency. Rect selections clear their bbox;
+    // polygon selections erase exactly their shape (translated to where
+    // the selection sits now) via destination-out.
+    if (sel.polygon) {
+      const dx = selection.x - sel.orig.x;
+      const dy = selection.y - sel.orig.y;
+      erasePolygonShape(
+        lctx,
+        sel.polygon.map((p) => ({ x: p.x + dx, y: p.y + dy }))
+      );
+    } else {
+      lctx.clearRect(selection.x, selection.y, selection.width, selection.height);
+    }
+
+    // The stroke hugs the silhouette — rebuild it so it wraps the new
+    // shape (or disappears entirely if everything inside was erased)
+    let stroke = layer.stroke;
+    if (layer.stroke) {
+      const rebuilt = buildStrokeCanvas(layer, layer.stroke.width);
+      stroke = rebuilt
+        ? { width: layer.stroke.width, canvas: rebuilt.canvas }
+        : undefined;
+    }
+
+    // Image layers: bounds may have shrunk — recompute from the pixels
+    let bounds = layer.bounds;
+    if (layer.kind === 'Image') {
+      const scanned = scanBounds(layer.canvas);
+      bounds = scanned
+        ? {
+            x: scanned.minX,
+            y: scanned.minY,
+            width: scanned.maxX - scanned.minX + 1,
+            height: scanned.maxY - scanned.minY + 1,
+          }
+        : undefined;
+    }
+
+    const next = layersRef.current.map((l) =>
+      l.id === layer.id ? { ...l, stroke, bounds } : l
+    );
+    layersRef.current = next;
+    setLayers(next);
+
+    composite();
+    pushSnapshot();
+    selRef.current = null;
+    setSelection(null);
   };
 
   // --- LAYER OPERATIONS (from the panel) ---
@@ -1262,6 +1794,17 @@ export function ImageCanvas() {
       // this, one-click selection ignores the copy (hit test skips layers
       // with no bounds).
       bounds: src.bounds ? { ...src.bounds } : undefined,
+      // The clone shows the same sticker, so it inherits the stroke canvas
+      // (a fresh copy — the two layers must not share one canvas)
+      stroke: src.stroke
+        ? (() => {
+            const strokeCanvas = document.createElement('canvas');
+            strokeCanvas.width = src.stroke.canvas.width;
+            strokeCanvas.height = src.stroke.canvas.height;
+            strokeCanvas.getContext('2d')?.drawImage(src.stroke.canvas, 0, 0);
+            return { width: src.stroke.width, canvas: strokeCanvas };
+          })()
+        : undefined,
     };
 
     const next = [...layersRef.current];
@@ -1357,6 +1900,15 @@ export function ImageCanvas() {
         >
           <Arrow />
         </Button>
+        <Button
+          variant={tool === 'polyline' ? 'secondary' : 'ghost'}
+          size="icon-sm"
+          onClick={() => changeTool('polyline')}
+          aria-pressed={tool === 'polyline'}
+          title="Polyline select"
+        >
+          <Lasso />
+        </Button>
         <label>
           Size: {brushSize}
           <input
@@ -1367,6 +1919,8 @@ export function ImageCanvas() {
             onChange={(e) => setBrushSize(Number(e.target.value))}
           />
         </label>
+        {/* Brush color dropdown: presets + native custom picker */}
+        <ColorPickerMenu color={brushColor} onChange={setBrushColor} />
         <Button variant="secondary" size='icon-sm' onClick={handleClear} title="Clear layer"><Trash/></Button>
         {/* The input is visually hidden; the button triggers it.
             This gives us a styled button with native file-picking. */}
@@ -1386,7 +1940,11 @@ export function ImageCanvas() {
           onExport={exportCanvas}
         />
         {/* Stickerize: white outline around the active layer's opaque pixels */}
-        <StickerizeMenu onStickerize={stickerizeLayer} />
+        <StickerizeMenu
+          hasSticker={!!layers.find((l) => l.id === activeLayerId)?.stroke}
+          onStickerize={stickerizeLayer}
+          onRemove={removeSticker}
+        />
         <Button variant="secondary" size='icon-sm' onClick={undo} disabled={historyInfo.index <= 0}>
          <Undo/>
         </Button>
@@ -1449,6 +2007,14 @@ export function ImageCanvas() {
         </div>
       )}
 
+      {polyPoints && (
+        <div style={{ marginBottom: 8, display: 'flex', gap: 8 }}>
+          <span className="self-center text-[13px] text-muted-foreground">
+            Click to add points · click the first point or press Enter to close · Esc to cancel
+          </span>
+        </div>
+      )}
+
       {/* Canvas + layers panel side by side */}
       <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
       {/* Viewport: the scrollable pan area, pinned to a FIXED size so
@@ -1486,7 +2052,13 @@ export function ImageCanvas() {
               transformOrigin: '0 0',
             }}
           >
-        <canvas
+        <ContextMenu
+          open={canvasMenuOpen && selection != null}
+          onOpenChange={setCanvasMenuOpen}
+        >
+        <ContextMenuTrigger
+          render={
+            <canvas
           ref={canvasRef}
           width={800}
           height={600}
@@ -1503,7 +2075,13 @@ export function ImageCanvas() {
           // Cursor follows the active tool: painting tools hide the native
           // cursor entirely — the size circle replaces it. Space = grab.
           // Select tool: hover-aware (resize arrows near selection handles).
-          cursor: isPanning ? 'grab' : tool === 'select' ? canvasCursor ?? ARROW_CURSOR : 'none',
+          cursor: isPanning
+            ? 'grab'
+            : tool === 'select'
+              ? canvasCursor ?? ARROW_CURSOR
+              : tool === 'polyline'
+                ? 'crosshair'
+                : 'none',
           // Zoomed in, show the actual bitmap pixels instead of a blur
           imageRendering: zoom > 1 ? 'pixelated' : 'auto',
           display: 'block',
@@ -1523,7 +2101,19 @@ export function ImageCanvas() {
           setEraserCursorVisible(false);
           handleMouseUpOrLeave();
         }}
-      />
+            />
+          }
+        />
+        {/* Right-click menu: opens only on right-click (Base UI handles the
+            contextmenu event) AND only while a selection exists — the open
+            prop above is gated on `selection`. */}
+        <ContextMenuContent>
+          <ContextMenuItem onClick={commitSelection}>Deselect</ContextMenuItem>
+          <ContextMenuItem variant='destructive' onClick={deleteSelection}>
+            Delete selection
+          </ContextMenuItem>
+        </ContextMenuContent>
+        </ContextMenu>
         {/* Cursor size indicator: circle matching the stroke radius for
             brush AND eraser. Rendered inside the relative container so
             canvas coords == container coords. pointerEvents:none keeps it
@@ -1550,7 +2140,7 @@ export function ImageCanvas() {
             During placement it captures the mouse (blocking drawing).
             During selection it's pointer-transparent so the base canvas
             keeps receiving the marquee/transform events. */}
-        {(placement || selection) && (
+        {(placement || selection || polyPoints) && (
           <canvas
             ref={overlayRef}
             width={800}

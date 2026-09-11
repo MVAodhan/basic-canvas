@@ -12,11 +12,16 @@ const STROKE_WIDTHS = [4, 8, 16, 24, 32]
 
 // Stickerize dropdown: wraps the active layer's opaque pixels in a white
 // outline of the chosen thickness. One click = one width — no dialog, and
-// the result is undoable like any other layer edit.
+// the result is undoable like any other layer edit. Picking a new width
+// replaces the previous stroke; "Remove stroke" strips it entirely.
 export const StickerizeMenu = ({
+  hasSticker,
   onStickerize,
+  onRemove,
 }: {
+  hasSticker: boolean
   onStickerize: (strokeWidth: number) => void
+  onRemove: () => void
 }) => {
   return (
     <DropdownMenu>
@@ -33,6 +38,10 @@ export const StickerizeMenu = ({
             White stroke · {width} px
           </DropdownMenuItem>
         ))}
+        {/* Only offered when the active layer actually has a stroke to strip */}
+        {hasSticker && (
+          <DropdownMenuItem onClick={onRemove}>Remove stroke</DropdownMenuItem>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   )

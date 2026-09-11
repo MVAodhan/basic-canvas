@@ -21,11 +21,15 @@ export type Layer = {
   // Only meaningful for Image layers: where the image sits on the canvas.
   // Enables one-click selection of the image's boundaries.
   bounds?: { x: number; y: number; width: number; height: number }
+  // Stickerize stroke, kept OUT of `canvas` on purpose: edits (paint,
+  // eraser, selection transforms) target `canvas`, so they can never
+  // corrupt or destroy the stroke. Drawn BENEATH the layer's pixels.
+  stroke?: { width: number; canvas: HTMLCanvasElement }
 }
 
 // Thumbnail: a tiny canvas that mirrors a layer's pixels. Redraws whenever
 // `version` bumps (the editor increments it after any pixel change).
-function LayerThumb({ canvas, version }: { canvas: HTMLCanvasElement; version: number }) {
+function LayerThumb({ canvas, stroke, version }: { canvas: HTMLCanvasElement; stroke?: HTMLCanvasElement; version: number }) {
   const ref = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {
@@ -33,8 +37,10 @@ function LayerThumb({ canvas, version }: { canvas: HTMLCanvasElement; version: n
     const ctx = el?.getContext('2d')
     if (!el || !ctx) return
     ctx.clearRect(0, 0, el.width, el.height)
+    // Same order as composite(): stroke beneath, pixels on top
+    if (stroke) ctx.drawImage(stroke, 0, 0, el.width, el.height)
     ctx.drawImage(canvas, 0, 0, el.width, el.height)
-  }, [canvas, version])
+  }, [canvas, stroke, version])
 
   return (
     <canvas
@@ -85,7 +91,7 @@ function SortableLayerRow({
                 : 'ring-transparent hover:bg-accent/60'
             } ${isDragging ? 'ring-blue-400/60' : ''}`}
           >
-            <LayerThumb canvas={layer.canvas} version={version} />
+            <LayerThumb canvas={layer.canvas} stroke={layer.stroke?.canvas} version={version} />
             <div className="min-w-0 flex-1 leading-tight">
               <div className={`flex items-center gap-1 truncate text-sm ${
                 isActive ? 'font-semibold text-foreground' : 'font-medium text-foreground'
