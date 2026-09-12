@@ -11,6 +11,19 @@ import { useSortable } from '@dnd-kit/react/sortable'
 
 export type LayerKind = 'Paint' | 'Image'
 
+export type TextItem = {
+  id: string
+  x: number
+  y: number
+  value: string
+  fontSize: number
+  color: string
+  // Rendered text on a tight-bbox canvas, drawn at (x, y). Kept separate
+  // from the layer's pixels so text can be re-edited, moved, and
+  // recolored without touching (or corrupting) the layer's pixels.
+  canvas: HTMLCanvasElement
+}
+
 export type Layer = {
   id: string
   name: string
@@ -25,11 +38,24 @@ export type Layer = {
   // eraser, selection transforms) target `canvas`, so they can never
   // corrupt or destroy the stroke. Drawn BENEATH the layer's pixels.
   stroke?: { width: number; canvas: HTMLCanvasElement }
+  // Text items, drawn ABOVE the layer's pixels. Same principle as the
+  // stroke: living outside `canvas` is what makes text re-selectable.
+  texts?: TextItem[]
 }
 
 // Thumbnail: a tiny canvas that mirrors a layer's pixels. Redraws whenever
 // `version` bumps (the editor increments it after any pixel change).
-function LayerThumb({ canvas, stroke, version }: { canvas: HTMLCanvasElement; stroke?: HTMLCanvasElement; version: number }) {
+function LayerThumb({
+  canvas,
+  stroke,
+  texts,
+  version,
+}: {
+  canvas: HTMLCanvasElement
+  stroke?: HTMLCanvasElement
+  texts?: TextItem[]
+  version: number
+}) {
   const ref = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {
@@ -37,10 +63,16 @@ function LayerThumb({ canvas, stroke, version }: { canvas: HTMLCanvasElement; st
     const ctx = el?.getContext('2d')
     if (!el || !ctx) return
     ctx.clearRect(0, 0, el.width, el.height)
-    // Same order as composite(): stroke beneath, pixels on top
+    // Same order as composite(): stroke beneath, pixels, then texts on top.
+    // Texts scale with the layer (the thumb squishes 800x600 into 44x44).
+    const sx = el.width / canvas.width
+    const sy = el.height / canvas.height
     if (stroke) ctx.drawImage(stroke, 0, 0, el.width, el.height)
     ctx.drawImage(canvas, 0, 0, el.width, el.height)
-  }, [canvas, stroke, version])
+    for (const t of texts ?? []) {
+      ctx.drawImage(t.canvas, t.x * sx, t.y * sy, t.canvas.width * sx, t.canvas.height * sy)
+    }
+  }, [canvas, stroke, texts, version])
 
   return (
     <canvas
@@ -91,7 +123,12 @@ function SortableLayerRow({
                 : 'ring-transparent hover:bg-accent/60'
             } ${isDragging ? 'ring-blue-400/60' : ''}`}
           >
-            <LayerThumb canvas={layer.canvas} stroke={layer.stroke?.canvas} version={version} />
+            <LayerThumb
+              canvas={layer.canvas}
+              stroke={layer.stroke?.canvas}
+              texts={layer.texts}
+              version={version}
+            />
             <div className="min-w-0 flex-1 leading-tight">
               <div className={`flex items-center gap-1 truncate text-sm ${
                 isActive ? 'font-semibold text-foreground' : 'font-medium text-foreground'

@@ -21,12 +21,36 @@ import { Load } from './load';
 import { ExportMenu } from './export-menu';
 import { ColorPickerMenu } from './color-picker-menu';
 import { StickerizeMenu } from './stickerize-menu';
-import { LayersPanel, type Layer, type LayerKind } from './LayersPanel';
-import { Layers as LayersIcon, Lasso } from 'lucide-react';
+import { LayersPanel, type Layer, type LayerKind, type TextItem } from './LayersPanel';
+import { Layers as LayersIcon, Lasso, Type, Move } from 'lucide-react';
 
-type Tool = 'brush' | 'eraser' | 'select' | 'polyline';
+type Tool = 'brush' | 'eraser' | 'select' | 'polyline' | 'text';
 
 type Point = { x: number; y: number };
+
+const TEXT_FONT = '"Geist Variable", sans-serif';
+
+// Renders a text block into a tight-bbox canvas. Module-level on purpose:
+// commit, layer duplication, and snapshot restore all need to (re)build
+// text canvases from the same props.
+const renderTextCanvas = (value: string, fontSize: number, color: string): HTMLCanvasElement => {
+  const lines = value.split('\n');
+  const lineHeight = Math.round(fontSize * 1.25);
+  const canvas = document.createElement('canvas');
+  const measure = document.createElement('canvas').getContext('2d');
+  if (!measure) return canvas;
+  measure.font = `${fontSize}px ${TEXT_FONT}`;
+  const width = Math.max(1, ...lines.map((l) => Math.ceil(measure.measureText(l).width)));
+  canvas.width = width + 2; // small buffer for anti-aliased edges
+  canvas.height = Math.max(1, lines.length * lineHeight + 2);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return canvas;
+  ctx.font = `${fontSize}px ${TEXT_FONT}`;
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = color;
+  lines.forEach((line, i) => ctx.fillText(line, 0, i * lineHeight));
+  return canvas;
+};
 
 type Handle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
@@ -79,6 +103,7 @@ export function ImageCanvas() {
   const [tool, setTool] = useState<Tool>('brush');
   const [brushSize, setBrushSize] = useState(20);
   const [brushColor, setBrushColor] = useState('#000000');
+  const [fontSize, setFontSize] = useState(32);
 
   // --- LAYERS ---
   // Each layer owns an OFFSCREEN canvas with its own pixels. The main
@@ -128,12 +153,19 @@ export function ImageCanvas() {
 
     ctx.globalCompositeOperation = 'source-over';
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // The text item being edited is hidden while its editor is open —
+    // otherwise the committed copy would double-print under the textarea
+    const editingTextId = textEditRef.current?.id;
     for (const layer of layersRef.current) {
       if (!layer.visible) continue;
       // Sticker stroke first (it grows OUTWARD from the pixels, so the
       // layer's own pixels must paint on top of it)
       if (layer.stroke) ctx.drawImage(layer.stroke.canvas, 0, 0);
       ctx.drawImage(layer.canvas, 0, 0);
+      for (const t of layer.texts ?? []) {
+        if (t.id === editingTextId) continue;
+        ctx.drawImage(t.canvas, t.x, t.y);
+      }
     }
 
     // Bump so layer thumbnails re-render with the new pixels
@@ -249,6 +281,39 @@ export function ImageCanvas() {
   // moves don't round-trip through React state.
   const [polyPoints, setPolyPoints] = useState<Point[] | null>(null);
   const polyCursorRef = useRef<Point | null>(null);
+
+  // --- TEXT ---
+  // Pending text edit. `id` present = re-editing an existing item (that
+  // item is hidden in the composite while the editor is open). color /
+  // fontSize live on the EDIT so re-selected text keeps its own style and
+  // toolbar changes update the pending text without committing.
+  const [textEdit, setTextEdit] = useState<{
+    id?: string;
+    x: number;
+    y: number;
+    value: string;
+    color: string;
+    fontSize: number;
+  } | null>(null);
+  const textEditRef = useRef<{
+    id?: string;
+    x: number;
+    y: number;
+    value: string;
+    color: string;
+    fontSize: number;
+  } | null>(null);
+  textEditRef.current = textEdit;
+  const textAreaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Size the editor to its content and keep focus while it exists
+  useEffect(() => {
+    const el = textAreaRef.current;
+    if (!el) return;
+    el.focus();
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, [textEdit]);
 
   // Polyline keyboard: Enter closes the polygon, Escape cancels. Bound
   // only while a polygon is in progress (the effect re-runs per change,
@@ -381,9 +446,11 @@ export function ImageCanvas() {
   const toolRef = useRef(tool);
   const brushSizeRef = useRef(brushSize);
   const brushColorRef = useRef(brushColor);
+  const fontSizeRef = useRef(fontSize);
   toolRef.current = tool;
   brushSizeRef.current = brushSize;
   brushColorRef.current = brushColor;
+  fontSizeRef.current = fontSize;
 
   // --- UNDO / REDO HISTORY ---
   // A snapshot captures the WHOLE layer stack: each layer's pixels
@@ -401,6 +468,9 @@ export function ImageCanvas() {
     // Sticker stroke pixels + width (absent = no stroke). Part of the
     // snapshot so undo/redo restores stickerized layers exactly.
     stroke?: { width: number; data: ImageData };
+    // Text items as PROPS (no canvas) — snapshots rebuild the canvases
+    // from these via renderTextCanvas, so they stay tiny.
+    texts?: { id: string; x: number; y: number; value: string; fontSize: number; color: string }[];
   };
   type Snapshot = { layers: LayerSnapshot[]; activeId: string | null };
 
@@ -445,6 +515,14 @@ export function ImageCanvas() {
                 ),
               }
             : undefined,
+          texts: layer.texts?.map((t) => ({
+            id: t.id,
+            x: t.x,
+            y: t.y,
+            value: t.value,
+            fontSize: t.fontSize,
+            color: t.color,
+          })),
         };
       }),
     });
@@ -494,6 +572,12 @@ export function ImageCanvas() {
         stroke = { width: s.stroke.width, canvas: strokeCanvas };
       }
 
+      // Rebuild text canvases from their props
+      const texts: Layer['texts'] = s.texts?.map((t) => ({
+        ...t,
+        canvas: renderTextCanvas(t.value, t.fontSize, t.color),
+      }));
+
       return {
         id: s.id,
         name: s.name,
@@ -502,6 +586,7 @@ export function ImageCanvas() {
         locked: s.locked,
         bounds: s.bounds,
         stroke,
+        texts,
         canvas,
       };
     });
@@ -1251,6 +1336,51 @@ export function ImageCanvas() {
       return;
     }
 
+    // Text tool: click ON an existing text re-opens it for editing
+    // (topmost first); click elsewhere starts a new one
+    if (toolRef.current === 'text') {
+      const layer = activeLayer();
+      if (!layer || layer.locked) return;
+      // Clicking elsewhere while editing commits the pending text first
+      if (textEditRef.current) commitText();
+      const { x, y } = getCanvasCoords(event);
+
+      const items = layer.texts ?? [];
+      for (let i = items.length - 1; i >= 0; i--) {
+        const t = items[i];
+        if (x >= t.x && x <= t.x + t.canvas.width && y >= t.y && y <= t.y + t.canvas.height) {
+          const edit = {
+            id: t.id,
+            x: t.x,
+            y: t.y,
+            value: t.value,
+            color: t.color,
+            fontSize: t.fontSize,
+          };
+          // Set the ref SYNCHRONOUSLY: composite() below reads it to hide
+          // the committed copy while its editor is open. setTextEdit alone
+          // wouldn't update the ref until the next render — composite
+          // would still see "no edit" and draw the old text, which then
+          // ghosts along under the editor while dragging.
+          textEditRef.current = edit;
+          setTextEdit(edit);
+          // Hide the committed copy while its editor is open
+          composite();
+          return;
+        }
+      }
+
+      // Cancel the default action (focus change). Without this, the
+      // browser's mousedown default fires AFTER the textarea mounts and
+      // autoFocuses — focus falls to <body> (the canvas isn't focusable),
+      // the blur commits the still-empty edit, and the editor dies before
+      // a single keystroke. Canceling pointerdown suppresses the
+      // compatibility mousedown and its focus change entirely.
+      event.preventDefault();
+      setTextEdit({ x, y, value: '', color: brushColor, fontSize });
+      return;
+    }
+
     // Paint on the ACTIVE layer's offscreen canvas — never the main canvas.
     // Locked layers refuse edits (that's the whole point of the lock).
     const layer = activeLayer();
@@ -1412,10 +1542,12 @@ export function ImageCanvas() {
   };
 
   // Switching tools commits any in-progress selection, so a brush stroke
-  // can never paint underneath a floating region. An in-progress polygon
-  // dies with the switch — it was never a selection yet.
+  // can never paint underneath a floating region. Pending text commits
+  // too, and an in-progress polygon dies with the switch — it was never
+  // a selection yet.
   const changeTool = (t: Tool) => {
     if (selRef.current) commitSelection();
+    if (textEditRef.current) commitText();
     setPolyPoints(null);
     polyCursorRef.current = null;
     setTool(t);
@@ -1464,9 +1596,10 @@ export function ImageCanvas() {
     if (!layer || layer.locked) return;
     const ctx = layer.canvas.getContext('2d');
     ctx?.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
-    // Nothing left to outline — drop the sticker with the pixels
+    // Nothing left to outline — drop the sticker and the text items with
+    // the pixels (undo restores all three: pixels, stroke, texts)
     const next = layersRef.current.map((l) =>
-      l.id === layer.id ? { ...l, stroke: undefined } : l
+      l.id === layer.id ? { ...l, stroke: undefined, texts: undefined } : l
     );
     layersRef.current = next;
     setLayers(next);
@@ -1739,6 +1872,87 @@ export function ImageCanvas() {
     setSelection(null);
   };
 
+  // --- TEXT ---
+  // Renders the editor's text into the active layer's TEXT ITEMS (never
+  // baked into the layer's pixels — that's what makes text re-selectable).
+  // Idempotent via textEditRef: blur and the next pointerdown can both
+  // call this in the same batch — only the first may commit.
+  const commitText = () => {
+    const edit = textEditRef.current;
+    if (!edit) return;
+    textEditRef.current = null;
+    setTextEdit(null);
+
+    const layer = activeLayer();
+    if (!layer || layer.locked) return;
+
+    // Cleared text on an existing item = delete that text
+    if (!edit.value.trim()) {
+      if (edit.id) {
+        const next = layersRef.current.map((l) =>
+          l.id === layer.id
+            ? { ...l, texts: (l.texts ?? []).filter((t) => t.id !== edit.id) }
+            : l
+        );
+        layersRef.current = next;
+        setLayers(next);
+        composite();
+        pushSnapshot();
+      }
+      return;
+    }
+
+    const item: TextItem = {
+      id: edit.id ?? Math.random().toString(36).slice(2),
+      x: edit.x,
+      y: edit.y,
+      value: edit.value,
+      fontSize: edit.fontSize,
+      color: edit.color,
+      canvas: renderTextCanvas(edit.value, edit.fontSize, edit.color),
+    };
+    const next = layersRef.current.map((l) => {
+      if (l.id !== layer.id) return l;
+      const texts = l.texts ?? [];
+      const idx = edit.id ? texts.findIndex((t) => t.id === edit.id) : -1;
+      return {
+        ...l,
+        texts: idx >= 0 ? texts.map((t, i) => (i === idx ? item : t)) : [...texts, item],
+      };
+    });
+    layersRef.current = next;
+    setLayers(next);
+
+    composite();
+    // Text is an action — make it undoable
+    pushSnapshot();
+  };
+
+  // Drag handle for the text editor: moves the pending text before it
+  // commits. Screen deltas divide by zoom — the editor lives in document
+  // coords inside the scaled container (same math as getCanvasCoords).
+  const textDragRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
+
+  const startTextEditDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!textEdit) return;
+    e.preventDefault(); // keep focus in the textarea — no blur, no commit
+    e.stopPropagation();
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    textDragRef.current = { startX: e.clientX, startY: e.clientY, origX: textEdit.x, origY: textEdit.y };
+  };
+
+  const moveTextEditDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = textDragRef.current;
+    if (!drag) return;
+    const dx = (e.clientX - drag.startX) / zoomRef.current;
+    const dy = (e.clientY - drag.startY) / zoomRef.current;
+    setTextEdit((prev) => (prev ? { ...prev, x: drag.origX + dx, y: drag.origY + dy } : prev));
+  };
+
+  const endTextEditDrag = () => {
+    textDragRef.current = null;
+  };
+
   // --- LAYER OPERATIONS (from the panel) ---
   const activateLayer = (id: string) => {
     setActiveLayerId(id);
@@ -1805,6 +2019,12 @@ export function ImageCanvas() {
             return { width: src.stroke.width, canvas: strokeCanvas };
           })()
         : undefined,
+      // Text items rebuild from props — fresh canvases, same look
+      texts: src.texts?.map((t) => ({
+        ...t,
+        id: Math.random().toString(36).slice(2),
+        canvas: renderTextCanvas(t.value, t.fontSize, t.color),
+      })),
     };
 
     const next = [...layersRef.current];
@@ -1909,18 +2129,43 @@ export function ImageCanvas() {
         >
           <Lasso />
         </Button>
+        <Button
+          variant={tool === 'text' ? 'secondary' : 'ghost'}
+          size="icon-sm"
+          onClick={() => changeTool('text')}
+          aria-pressed={tool === 'text'}
+          title="Text"
+        >
+          <Type />
+        </Button>
         <label>
-          Size: {brushSize}
+          {tool === 'text' ? 'Font' : 'Size'}: {tool === 'text' ? fontSize : brushSize}
           <input
             type="range"
-            min={1}
-            max={100}
-            value={brushSize}
-            onChange={(e) => setBrushSize(Number(e.target.value))}
+            min={tool === 'text' ? 8 : 1}
+            max={tool === 'text' ? 200 : 100}
+            value={tool === 'text' ? fontSize : brushSize}
+            onChange={(e) => {
+              const next = Number(e.target.value);
+              if (tool === 'text') {
+                setFontSize(next);
+                // Live-update the pending text, so resizing mid-edit works
+                setTextEdit((prev) => (prev ? { ...prev, fontSize: next } : prev));
+              } else {
+                setBrushSize(next);
+              }
+            }}
           />
         </label>
         {/* Brush color dropdown: presets + native custom picker */}
-        <ColorPickerMenu color={brushColor} onChange={setBrushColor} />
+        <ColorPickerMenu
+          color={brushColor}
+          onChange={(c) => {
+            setBrushColor(c);
+            // Live-update the pending text, so recoloring mid-edit works
+            setTextEdit((prev) => (prev ? { ...prev, color: c } : prev));
+          }}
+        />
         <Button variant="secondary" size='icon-sm' onClick={handleClear} title="Clear layer"><Trash/></Button>
         {/* The input is visually hidden; the button triggers it.
             This gives us a styled button with native file-picking. */}
@@ -2015,6 +2260,14 @@ export function ImageCanvas() {
         </div>
       )}
 
+      {textEdit && (
+        <div style={{ marginBottom: 8, display: 'flex', gap: 8 }}>
+          <span className="self-center text-[13px] text-muted-foreground">
+            Type · drag the handle to move · Enter to place · Shift+Enter for a new line · Esc to discard
+          </span>
+        </div>
+      )}
+
       {/* Canvas + layers panel side by side */}
       <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
       {/* Viewport: the scrollable pan area, pinned to a FIXED size so
@@ -2081,7 +2334,9 @@ export function ImageCanvas() {
               ? canvasCursor ?? ARROW_CURSOR
               : tool === 'polyline'
                 ? 'crosshair'
-                : 'none',
+                : tool === 'text'
+                  ? 'text'
+                  : 'none',
           // Zoomed in, show the actual bitmap pixels instead of a blur
           imageRendering: zoom > 1 ? 'pixelated' : 'auto',
           display: 'block',
@@ -2114,6 +2369,78 @@ export function ImageCanvas() {
           </ContextMenuItem>
         </ContextMenuContent>
         </ContextMenu>
+        {/* Text editor overlay: lives in the scaled container so it tracks
+            zoom and lands exactly where the text will commit. Same font,
+            size, and color as the commit path. Enter commits,
+            Shift+Enter newlines, Esc discards. */}
+        {textEdit && (
+          <>
+            {/* Drag handle: sits just left of the editor box. Pointer capture
+                keeps the drag alive outside the handle (same pattern as pan). */}
+            <div
+              onPointerDown={startTextEditDrag}
+              onPointerMove={moveTextEditDrag}
+              onPointerUp={endTextEditDrag}
+              title='Drag to move text'
+              style={{
+                position: 'absolute',
+                left: textEdit.x - 20,
+                top: textEdit.y,
+                width: 16,
+                height: 16,
+                display: 'grid',
+                placeItems: 'center',
+                color: '#3b82f6',
+                background: 'var(--background)',
+                border: '1px solid #3b82f6',
+                borderRadius: 4,
+                cursor: 'move',
+                touchAction: 'none',
+              }}
+            >
+              <Move size={11} />
+            </div>
+            <textarea
+            ref={textAreaRef}
+            value={textEdit.value}
+            autoFocus
+            spellCheck={false}
+            wrap='off'
+            onChange={(e) => setTextEdit((prev) => (prev ? { ...prev, value: e.target.value } : prev))}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                commitText();
+              } else if (e.key === 'Escape') {
+                e.preventDefault();
+                textEditRef.current = null;
+                setTextEdit(null);
+                // Redraw: the item hidden while its editor was open reappears
+                composite();
+              }
+            }}
+            style={{
+              position: 'absolute',
+              left: textEdit.x,
+              top: textEdit.y,
+              width: 320,
+              minHeight: 20,
+              padding: 0,
+              margin: 0,
+              border: '1px dashed #3b82f6',
+              background: 'transparent',
+              outline: 'none',
+              resize: 'none',
+              overflow: 'hidden',
+              whiteSpace: 'pre',
+              color: textEdit.color,
+              font: `${textEdit.fontSize}px "Geist Variable", sans-serif`,
+              lineHeight: 1.25,
+            }}
+          />
+          </>
+        )}
         {/* Cursor size indicator: circle matching the stroke radius for
             brush AND eraser. Rendered inside the relative container so
             canvas coords == container coords. pointerEvents:none keeps it
