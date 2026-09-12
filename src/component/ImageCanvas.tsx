@@ -266,6 +266,10 @@ export function ImageCanvas() {
     // rect machinery moves around; the ants are drawn from these points
     // translated by (selection - orig).
     polygon?: Point[];
+    // Inverse selections: the KEPT shape (the hole in the complement),
+    // frozen at its position when the selection was inverted. The region
+    // is everything ELSE within the canvas.
+    inverseShape?: { rect?: Rect; polygon?: Point[] };
   } | null>(null);
 
   // Canvas right-click menu. CONTROLLED, and gated on `selection` — the
@@ -400,8 +404,10 @@ export function ImageCanvas() {
     if (selection) {
       // Dashed border = the classic "marching ants" (a static version).
       // Polygon selections draw their outline instead of the bbox rect —
-      // the bbox would misrepresent what's actually selected.
+      // the bbox would misrepresent what's actually selected. Inverse
+      // selections draw the canvas border PLUS the kept shape.
       const poly = displayedPolyPoints();
+      const inv = selRef.current?.inverseShape;
       ctx.strokeStyle = '#3b82f6';
       ctx.lineWidth = 1;
       ctx.setLineDash([6, 4]);
@@ -410,6 +416,27 @@ export function ImageCanvas() {
         poly.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
         ctx.closePath();
         ctx.stroke();
+      } else if (inv && selRef.current) {
+        const dx = selection.x - selRef.current.orig.x;
+        const dy = selection.y - selRef.current.orig.y;
+        // Outer edge (the canvas border), translated with the selection
+        ctx.strokeRect(dx + 0.5, dy + 0.5, overlay.width - 1, overlay.height - 1);
+        // Inner edge (the kept shape)
+        if (inv.rect) {
+          ctx.strokeRect(
+            inv.rect.x + dx + 0.5,
+            inv.rect.y + dy + 0.5,
+            inv.rect.width,
+            inv.rect.height
+          );
+        } else if (inv.polygon) {
+          ctx.beginPath();
+          inv.polygon.forEach((p, i) =>
+            i === 0 ? ctx.moveTo(p.x + dx, p.y + dy) : ctx.lineTo(p.x + dx, p.y + dy)
+          );
+          ctx.closePath();
+          ctx.stroke();
+        }
       } else {
         ctx.strokeRect(selection.x + 0.5, selection.y + 0.5, selection.width, selection.height);
         drawHandles(ctx, selection);
@@ -903,6 +930,30 @@ export function ImageCanvas() {
     ctx.globalCompositeOperation = 'source-over';
   };
 
+  // Erase the COMPLEMENT of a shape — everything EXCEPT it — via an
+  // evenodd fill: the outer canvas rect with the shape as a hole. This is
+  // what makes inverse selections work: the lift hole, the floating
+  // region, and delete-outside all use this one path.
+  const eraseComplementShape = (
+    ctx: CanvasRenderingContext2D,
+    shape: { rect?: Rect; polygon?: Point[] }
+  ) => {
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = '#000'; // color ignored; only the shape matters
+    ctx.beginPath();
+    ctx.rect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    if (shape.rect) {
+      ctx.rect(shape.rect.x, shape.rect.y, shape.rect.width, shape.rect.height);
+    } else if (shape.polygon) {
+      shape.polygon.forEach((p, i) =>
+        i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)
+      );
+      ctx.closePath();
+    }
+    ctx.fill('evenodd');
+    ctx.globalCompositeOperation = 'source-over';
+  };
+
   // --- ONE-CLICK IMAGE SELECT ---
   // Topmost-first hit test over visible, unlocked Image layers: the click
   // must be inside the layer's bounds AND on an opaque pixel (transparent
@@ -1105,8 +1156,12 @@ export function ImageCanvas() {
     lctx.drawImage(sel.base, 0, 0);
     // The hole is the LIFTED shape at its original position — for polygons
     // that's the polygon itself, NOT its bbox (the bbox would also wipe
-    // the unselected pixels between the shape and its box)
-    if (sel.polygon) {
+    // the unselected pixels between the shape and its box). For inverse
+    // selections the hole is the COMPLEMENT, so the lift renders the
+    // layer unchanged: base - complement + complement = base.
+    if (sel.inverseShape) {
+      eraseComplementShape(lctx, sel.inverseShape);
+    } else if (sel.polygon) {
       erasePolygonShape(lctx, sel.polygon);
     } else {
       lctx.clearRect(sel.orig.x, sel.orig.y, sel.orig.width, sel.orig.height);
@@ -1120,7 +1175,9 @@ export function ImageCanvas() {
       sctx.globalCompositeOperation = 'source-over';
       sctx.clearRect(0, 0, layer.stroke.canvas.width, layer.stroke.canvas.height);
       sctx.drawImage(sel.strokeBase, 0, 0);
-      if (sel.polygon) {
+      if (sel.inverseShape) {
+        eraseComplementShape(sctx, sel.inverseShape);
+      } else if (sel.polygon) {
         erasePolygonShape(sctx, sel.polygon);
       } else {
         sctx.clearRect(sel.orig.x, sel.orig.y, sel.orig.width, sel.orig.height);
@@ -1182,6 +1239,14 @@ export function ImageCanvas() {
 
     // Already have a selection? Check for handle/body grabs first.
     if (selection && selRef.current) {
+      const inv = selRef.current.inverseShape;
+      if (inv) {
+        // Inverse selections cover the whole canvas — every click is
+        // "inside", so they move as a whole (no handles, no click-outside
+        // commit; use Deselect or a tool switch to drop one)
+        dragRef.current = { mode: 'move', startX: x, startY: y, orig: { ...selection } };
+        return;
+      }
       const poly = displayedPolyPoints();
       if (poly) {
         // Polygon selections move but don't resize — no handles to hit
@@ -1419,9 +1484,13 @@ export function ImageCanvas() {
         if (selection) {
           const { x, y } = getCanvasCoords(event);
           const poly = displayedPolyPoints();
+          const inv = selRef.current?.inverseShape;
           if (poly) {
             // Polygon selections have no resize handles — just move
             setCanvasCursor(pointInPolygon(poly, x, y) ? 'move' : ARROW_CURSOR);
+          } else if (inv) {
+            // Inverse selections cover everything — always move
+            setCanvasCursor('move');
           } else {
             const handle = hitTestHandle(selection, x, y);
             const inside =
@@ -1823,9 +1892,17 @@ export function ImageCanvas() {
     if (!lctx) return;
 
     // Deletion is just transparency. Rect selections clear their bbox;
-    // polygon selections erase exactly their shape (translated to where
-    // the selection sits now) via destination-out.
-    if (sel.polygon) {
+    // polygon selections erase exactly their shape; INVERSE selections
+    // erase their complement (translated to where the selection sits
+    // now) — the kept shape's pixels survive.
+    if (sel.inverseShape) {
+      const dx = selection.x - sel.orig.x;
+      const dy = selection.y - sel.orig.y;
+      lctx.save();
+      lctx.translate(dx, dy);
+      eraseComplementShape(lctx, sel.inverseShape);
+      lctx.restore();
+    } else if (sel.polygon) {
       const dx = selection.x - sel.orig.x;
       const dy = selection.y - sel.orig.y;
       erasePolygonShape(
@@ -1870,6 +1947,81 @@ export function ImageCanvas() {
     pushSnapshot();
     selRef.current = null;
     setSelection(null);
+  };
+
+  // --- SELECT INVERSE ---
+  // The floating region becomes everything EXCEPT the selected shape
+  // (within the canvas). "Delete selection" on an inverse selection then
+  // erases the outside — the classic invert+delete workflow. The kept
+  // shape is frozen at its current position.
+  const invertSelection = () => {
+    const sel = selRef.current;
+    if (!sel || !selection || sel.inverseShape) return;
+    const target = selTargetLayer();
+    if (!target || target.locked) return;
+    const layerId = target.id;
+
+    // The kept shape, frozen at its CURRENT position
+    const shape: { rect?: Rect; polygon?: Point[] } = sel.polygon
+      ? { polygon: displayedPolyPoints() ?? [] }
+      : { rect: { ...selection } };
+
+    // The floating pixels land first — the inverse lifts from the
+    // committed state
+    commitSelection();
+    const layer = layersRef.current.find((l) => l.id === layerId);
+    if (!layer) return;
+
+    const W = layer.canvas.width;
+    const H = layer.canvas.height;
+    const full: Rect = { x: 0, y: 0, width: W, height: H };
+
+    // base = full stash; region = the COMPLEMENT (base with the kept
+    // shape erased). redrawSelection's hole is the complement too, so at
+    // lift the layer renders unchanged: base - complement + complement.
+    const base = document.createElement('canvas');
+    base.width = W;
+    base.height = H;
+    base.getContext('2d')?.drawImage(layer.canvas, 0, 0);
+
+    const region = document.createElement('canvas');
+    region.width = W;
+    region.height = H;
+    const rctx = region.getContext('2d');
+    if (!rctx) return;
+    rctx.drawImage(layer.canvas, 0, 0);
+    eraseComplementShape(rctx, shape);
+
+    // Stroke ride-along: same complement treatment
+    let strokeBase: HTMLCanvasElement | undefined;
+    let strokeRegion: HTMLCanvasElement | undefined;
+    if (layer.stroke) {
+      strokeBase = document.createElement('canvas');
+      strokeBase.width = W;
+      strokeBase.height = H;
+      strokeBase.getContext('2d')?.drawImage(layer.stroke.canvas, 0, 0);
+
+      strokeRegion = document.createElement('canvas');
+      strokeRegion.width = W;
+      strokeRegion.height = H;
+      const srctx = strokeRegion.getContext('2d');
+      if (!srctx) return;
+      srctx.drawImage(layer.stroke.canvas, 0, 0);
+      eraseComplementShape(srctx, shape);
+    }
+
+    selRef.current = {
+      base,
+      region,
+      orig: full,
+      layerId,
+      isImageSelect: false,
+      inverseShape: shape,
+      strokeBase,
+      strokeRegion,
+    };
+    setSelection(full);
+    redrawSelection(full);
   };
 
   // --- TEXT ---
@@ -2363,6 +2515,12 @@ export function ImageCanvas() {
             contextmenu event) AND only while a selection exists — the open
             prop above is gated on `selection`. */}
         <ContextMenuContent>
+          {/* Only for a normal selection — an already-inverse selection
+              can't be re-inverted (its complement isn't representable as
+              a single kept shape) */}
+          {selRef.current && !selRef.current.inverseShape && (
+            <ContextMenuItem onClick={invertSelection}>Select inverse</ContextMenuItem>
+          )}
           <ContextMenuItem onClick={commitSelection}>Deselect</ContextMenuItem>
           <ContextMenuItem variant='destructive' onClick={deleteSelection}>
             Delete selection
